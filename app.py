@@ -122,12 +122,23 @@ def _refresh_stale_tokens():
                 rows = conn.execute("SELECT id, last_refresh_time FROM accounts WHERE enabled=1").fetchall()
                 for row in rows:
                     acc_id, last_refresh = row[0], row[1]
-                    if last_refresh:
+                    should_refresh = False
+                    if not last_refresh or last_refresh == "never":
+                        should_refresh = True
+                    else:
                         try:
                             last_time = time.mktime(time.strptime(last_refresh, "%Y-%m-%dT%H:%M:%S"))
                             if now - last_time > 1500:  # 25 minutes
-                                refresh_access_token_in_db(acc_id)
+                                should_refresh = True
                         except Exception:
+                            # Malformed or unparsable timestamp; force refresh
+                            should_refresh = True
+
+                    if should_refresh:
+                        try:
+                            refresh_access_token_in_db(acc_id)
+                        except Exception:
+                            # Ignore per-account refresh failure; timestamp/status are recorded inside
                             pass
         except Exception:
             pass
@@ -272,6 +283,20 @@ def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
             )
             conn.commit()
             raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
+        except Exception as e:
+            # Ensure last_refresh_time is recorded even on unexpected errors
+            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            status = "failed"
+            conn.execute(
+                """
+                UPDATE accounts
+                SET last_refresh_time=?, last_refresh_status=?, updated_at=?
+                WHERE id=?
+                """,
+                (now, status, now, account_id),
+            )
+            conn.commit()
+            raise
 
         conn.execute(
             """
