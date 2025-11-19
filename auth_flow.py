@@ -15,20 +15,10 @@ def _get_proxies() -> Optional[Dict[str, str]]:
 
 def _create_proxy_mounts(proxy_url: str):
     """创建代理传输层,支持 HTTP/HTTPS 和 SOCKS5"""
-    if proxy_url.startswith("socks5://"):
-        try:
-            from httpx_socks import AsyncProxyTransport
-            return {
-                "https://": AsyncProxyTransport.from_url(proxy_url),
-                "http://": AsyncProxyTransport.from_url(proxy_url),
-            }
-        except ImportError:
-            raise RuntimeError("SOCKS5 proxy requires 'httpx-socks' package. Install: pip install httpx-socks")
-    else:
-        return {
-            "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-        }
+    return {
+        "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+        "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+    }
 
 # OIDC endpoints and constants (aligned with v1/auth_client.py)
 OIDC_BASE = "https://oidc.us-east-1.amazonaws.com"

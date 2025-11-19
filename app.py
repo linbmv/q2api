@@ -119,20 +119,10 @@ def _get_proxies() -> Optional[Dict[str, str]]:
 
 def _create_proxy_mounts(proxy_url: str):
     """创建代理传输层,支持 HTTP/HTTPS 和 SOCKS5"""
-    if proxy_url.startswith("socks5://"):
-        try:
-            from httpx_socks import AsyncProxyTransport
-            return {
-                "https://": AsyncProxyTransport.from_url(proxy_url),
-                "http://": AsyncProxyTransport.from_url(proxy_url),
-            }
-        except ImportError:
-            raise RuntimeError("SOCKS5 proxy requires 'httpx-socks' package. Install: pip install httpx-socks")
-    else:
-        return {
-            "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-        }
+    return {
+        "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+        "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+    }
 
 async def _init_global_client():
     global GLOBAL_CLIENT
