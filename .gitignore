@@ -33,6 +33,7 @@ wheels/
 *.sqlite3-shm
 *.sqlite3-wal
 *.db
+data/
 
 # IDE
 .vscode/

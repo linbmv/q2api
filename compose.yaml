@@ -1,0 +1,22 @@
+services:
+  q2api:
+    # Use the image from GHCR (replace 'linbmv' with your actual username if different)
+    # or build locally:
+    # build: .
+    image: ghcr.io/linbmv/q2api:latest
+    container_name: q2api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the SQLite database
+      - ./data:/app/data
+      # Mount .env if you prefer file-based config
+      # - ./.env:/app/.env
+    environment:
+      - OPENAI_KEYS=${OPENAI_KEYS:-}
+      - MAX_ERROR_COUNT=${MAX_ERROR_COUNT:-100}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - ENABLE_CONSOLE=${ENABLE_CONSOLE:-true}
+      # If you need to set timezone
+      - TZ=Asia/Shanghai
