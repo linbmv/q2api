@@ -117,6 +117,23 @@ def _get_proxies() -> Optional[Dict[str, str]]:
         return {"http": proxy, "https": proxy}
     return None
 
+def _create_proxy_mounts(proxy_url: str):
+    """创建代理传输层,支持 HTTP/HTTPS 和 SOCKS5"""
+    if proxy_url.startswith("socks5://"):
+        try:
+            from httpx_socks import AsyncProxyTransport
+            return {
+                "https://": AsyncProxyTransport.from_url(proxy_url),
+                "http://": AsyncProxyTransport.from_url(proxy_url),
+            }
+        except ImportError:
+            raise RuntimeError("SOCKS5 proxy requires 'httpx-socks' package. Install: pip install httpx-socks")
+    else:
+        return {
+            "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+        }
+
 async def _init_global_client():
     global GLOBAL_CLIENT
     proxies = _get_proxies()
@@ -124,10 +141,7 @@ async def _init_global_client():
     if proxies:
         proxy_url = proxies.get("https") or proxies.get("http")
         if proxy_url:
-            mounts = {
-                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-            }
+            mounts = _create_proxy_mounts(proxy_url)
     # Increased limits for high concurrency with streaming
     # max_connections: 总连接数上限
     # max_keepalive_connections: 保持活跃的连接数
@@ -860,7 +874,13 @@ if CONSOLE_ENABLED:
             cid, csec = await register_client_min()
             dev = await device_authorize(cid, csec)
         except httpx.HTTPError as e:
+            print(f"[ERROR] OIDC HTTP error in auth_start: {type(e).__name__}: {str(e)}")
+            traceback.print_exc()
             raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+        except Exception as e:
+            print(f"[ERROR] Unexpected error in auth_start: {type(e).__name__}: {str(e)}")
+            traceback.print_exc()
+            raise HTTPException(status_code=502, detail=f"Auth start failed: {str(e)}")
 
         auth_id = str(uuid.uuid4())
         sess = {
