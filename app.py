@@ -507,6 +507,36 @@ def _openai_non_streaming_response(text: str, model: Optional[str]) -> Dict[str,
 def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
+@app.post("/v1/messages/count_tokens")
+async def count_tokens(req: ClaudeRequest):
+    """
+    Claude token counting endpoint (approximation).
+    """
+    # 简单估算：每个字符约 0.25 token
+    total_chars = 0
+
+    if req.system:
+        if isinstance(req.system, str):
+            total_chars += len(req.system)
+        elif isinstance(req.system, list):
+            for b in req.system:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    total_chars += len(b.get("text", ""))
+
+    for msg in req.messages:
+        content = msg.content
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        total_chars += len(block.get("text", ""))
+
+    estimated_tokens = int(total_chars * 0.25)
+
+    return {"input_tokens": estimated_tokens}
+
 @app.post("/v1/messages")
 async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(require_account)):
     """
