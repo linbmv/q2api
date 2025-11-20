@@ -1,6 +1,6 @@
 import os
 import json
-import traceback
+import logging
 import uuid
 import time
 import asyncio
@@ -97,8 +97,7 @@ try:
     convert_claude_to_amazonq_request = _claude_converter.convert_claude_to_amazonq_request
     ClaudeStreamHandler = _claude_stream.ClaudeStreamHandler
 except Exception as e:
-    print(f"Failed to load Claude modules: {e}")
-    traceback.print_exc()
+    logging.error(f"Failed to load Claude modules: {e}", exc_info=True)
     # Define dummy classes to avoid NameError on startup if loading fails
     class ClaudeRequest(BaseModel):
         pass
@@ -138,7 +137,7 @@ async def _init_global_client():
     # keepalive_expiry: 连接保持时间
     limits = httpx.Limits(
         max_keepalive_connections=60,
-        max_connections=60,  # 提高到500以支持更高并发
+        max_connections=60,  # 60个并发连接
         keepalive_expiry=30.0  # 30秒后释放空闲连接
     )
     # 为流式响应设置更长的超时
@@ -247,13 +246,10 @@ async def _refresh_stale_tokens():
                         if should_refresh:
                             try:
                                 await refresh_access_token_in_db(acc_id)
-                            except Exception:
-                                traceback.print_exc()
-                                # Ignore per-account refresh failure; timestamp/status are recorded inside
-                                pass
-        except Exception:
-            traceback.print_exc()
-            pass
+                            except Exception as e:
+                                logging.warning(f"Refresh token failed for account {acc_id}: {e}", exc_info=True)
+        except Exception as e:
+            logging.error(f"Background refresh loop error: {e}", exc_info=True)
 
 # ------------------------------------------------------------------------------
 # Env and API Key authorization (keys are independent of AWS accounts)
@@ -545,11 +541,15 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
     """
     Claude-compatible messages endpoint.
     """
+    # Check if Claude modules are available
+    if not callable(convert_claude_to_amazonq_request) or not ClaudeStreamHandler:
+        raise HTTPException(status_code=503, detail="Claude modules not available")
+
     # 1. Convert request
     try:
         aq_request = convert_claude_to_amazonq_request(req)
     except Exception as e:
-        traceback.print_exc()
+        logging.error(f"Request conversion failed: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
     # 2. Send upstream
@@ -766,7 +766,11 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
         try:
             _, it, tracker = await _send_upstream(stream=True)
             assert it is not None
-            first_piece = await it.__anext__()
+            try:
+                first_piece = await it.__anext__()
+            except StopAsyncIteration:
+                await _update_stats(account["id"], False)
+                raise HTTPException(status_code=502, detail="No content from upstream")
             if not first_piece:
                 await _update_stats(account["id"], False)
                 raise HTTPException(status_code=502, detail="No content from upstream")
@@ -897,13 +901,11 @@ if CONSOLE_ENABLED:
             cid, csec = await register_client_min()
             dev = await device_authorize(cid, csec)
         except httpx.HTTPError as e:
-            print(f"[ERROR] OIDC HTTP error in auth_start: {type(e).__name__}: {str(e)}")
-            traceback.print_exc()
-            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+            logging.error(f"OIDC HTTP error in auth_start: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail="OIDC error")
         except Exception as e:
-            print(f"[ERROR] Unexpected error in auth_start: {type(e).__name__}: {str(e)}")
-            traceback.print_exc()
-            raise HTTPException(status_code=502, detail=f"Auth start failed: {str(e)}")
+            logging.error(f"Unexpected error in auth_start: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail="Auth start failed")
 
         auth_id = str(uuid.uuid4())
         sess = {
