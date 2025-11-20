@@ -3,11 +3,69 @@ import uuid
 import os
 import asyncio
 import weakref
+import logging
+import re
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any
+from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any, Set
 import struct
 import httpx
 import importlib.util
+
+# Amazon Q 支持的规范模型 ID 白名单
+ALLOWED_CANONICAL_MODELS: Set[str] = {
+    "claude-sonnet-4.5",
+    "claude-sonnet-4",
+    "claude-sonnet-3.5",
+}
+
+# 默认规范模型（验证有效性）
+DEFAULT_CANONICAL_MODEL = os.getenv("DEFAULT_MODEL_ID", "claude-sonnet-4.5")
+if DEFAULT_CANONICAL_MODEL not in ALLOWED_CANONICAL_MODELS:
+    logging.warning(
+        "DEFAULT_MODEL_ID '%s' not in allowed set; falling back to 'claude-sonnet-4.5'",
+        DEFAULT_CANONICAL_MODEL,
+    )
+    DEFAULT_CANONICAL_MODEL = "claude-sonnet-4.5"
+
+# 模型名称映射表
+MODEL_MAPPING: Dict[str, str] = {
+    # Claude 4.5
+    "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+    "claude-haiku-4-5-20251001": "claude-sonnet-4.5",
+    # Claude 4
+    "claude-sonnet-4-20250514": "claude-sonnet-4",
+    # Claude 3.5
+    "claude-3-5-sonnet-20241022": "claude-sonnet-3.5",
+    "claude-3-5-haiku-20241022": "claude-sonnet-3.5",
+}
+
+# 记录已警告的未映射模型，避免日志泛滥
+_WARNED_UNMAPPED: Set[str] = set()
+
+def canonicalize_model_name(model: str) -> str:
+    """将模型名称规范化为 Amazon Q 接受的格式"""
+    # 归一化：去空白、转小写、统一分隔符
+    norm = re.sub(r"[\s_]+", "-", model.strip().lower())
+
+    # 精确映射表查找
+    mapped = MODEL_MAPPING.get(norm)
+    if mapped:
+        return mapped
+
+    # 模式匹配：支持未来的日期后缀变体
+    if re.match(r"^claude-(?:sonnet|haiku)-4-5-\d{8}$", norm):
+        return "claude-sonnet-4.5"
+    if re.match(r"^claude-sonnet-4-\d{8}$", norm):
+        return "claude-sonnet-4"
+    if re.match(r"^claude-3-5-(?:sonnet|haiku)-\d{8}$", norm):
+        return "claude-sonnet-3.5"
+
+    # 如果已经是规范名称，保持不变
+    if norm in ALLOWED_CANONICAL_MODELS:
+        return norm
+
+    # 返回归一化后的原始名称（由调用者检查）
+    return norm
 
 def _load_claude_parser():
     """Dynamically load claude_parser module."""
@@ -207,10 +265,30 @@ def inject_history(body_json: Dict[str, Any], history_text: str) -> None:
 def inject_model(body_json: Dict[str, Any], model: Optional[str]) -> None:
     if not model:
         return
+
+    # 使用规范化函数转换模型名称
+    mapped = canonicalize_model_name(model)
+
+    # 白名单校验 + 兜底
+    if mapped not in ALLOWED_CANONICAL_MODELS:
+        # 避免重复警告同一个模型
+        norm = re.sub(r"[\s_]+", "-", model.strip().lower())
+        if norm not in _WARNED_UNMAPPED:
+            logging.warning(
+                "Model '%s' mapped to '%s' not in allowed set; falling back to default '%s'",
+                model, mapped, DEFAULT_CANONICAL_MODEL,
+            )
+            _WARNED_UNMAPPED.add(norm)
+        mapped = DEFAULT_CANONICAL_MODEL
+
+    # 写入模型 ID
     try:
-        body_json["conversationState"]["currentMessage"]["userInputMessage"]["modelId"] = model
-    except Exception:
-        pass
+        cur = body_json["conversationState"]["currentMessage"]["userInputMessage"]
+        if cur.get("modelId") != mapped:
+            cur["modelId"] = mapped
+            logging.debug("Model '%s' mapped to canonical '%s'", model, mapped)
+    except Exception as e:
+        logging.error("Failed to inject modelId: %s", e, exc_info=True)
 
 async def send_chat_request(
     access_token: str,
