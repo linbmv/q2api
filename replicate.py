@@ -266,17 +266,28 @@ async def send_chat_request(
         
         if resp.status_code >= 400:
             import logging
+
+            # Read error body safely in async streaming mode
             try:
-                await resp.read()
-                err = resp.text if resp.text else f"Empty response body"
+                raw = await resp.aread()
+                encoding = resp.charset_encoding or "utf-8"
+                err_text = raw.decode(encoding, errors="replace") if raw else "Empty response body"
+                err_text = err_text[:8192]  # Limit log size
             except Exception as e:
-                err = f"Failed to read response: {e}"
-            logging.error(f"Upstream error {resp.status_code}: {err}")
-            logging.error(f"Request URL: {req.url}, Headers: {dict(req.headers)}")
+                err_text = f"Failed to read response body: {e}"
+
+            # Extract upstream diagnostic headers
+            req_id = resp.headers.get("x-amzn-requestid") or resp.headers.get("x-amz-request-id")
+            err_type = resp.headers.get("x-amzn-errortype")
+
+            logging.error(
+                f"Upstream error {resp.status_code} (RequestId={req_id}, ErrType={err_type}): {err_text}"
+            )
+
             await resp.aclose()
             if local_client:
                 await client.aclose()
-            raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err}")
+            raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err_text}")
         
         parser = AwsEventStreamParser()
         tracker = StreamTracker()
