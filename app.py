@@ -6,6 +6,7 @@ import time
 import asyncio
 import importlib.util
 import random
+import hmac
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 
@@ -276,6 +277,24 @@ def _is_console_enabled() -> bool:
     return console_env not in ("false", "0", "no", "disabled")
 
 CONSOLE_ENABLED: bool = _is_console_enabled()
+CONSOLE_TOKEN: Optional[str] = os.getenv("CONSOLE_TOKEN", "").strip() or None
+
+def require_console_auth(authorization: Optional[str] = Header(default=None)):
+    """前端控制台鉴权"""
+    if not CONSOLE_TOKEN:
+        return  # 未设置 token 则不鉴权
+
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+
+    # 使用常量时间比较防止时序攻击
+    if not token or not hmac.compare_digest(token, CONSOLE_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer realm=\"console\""}
+        )
 
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
@@ -933,7 +952,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str):
+    async def auth_status(auth_id: str, _auth = Depends(require_console_auth)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
@@ -948,7 +967,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str):
+    async def auth_claim(auth_id: str, _auth = Depends(require_console_auth)):
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1036,7 +1055,7 @@ if CONSOLE_ENABLED:
                 return _row_to_dict(row)
 
     @app.get("/v2/accounts")
-    async def list_accounts():
+    async def list_accounts(_auth = Depends(require_console_auth)):
         async with _conn() as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute("SELECT * FROM accounts ORDER BY created_at DESC") as cursor:
@@ -1044,11 +1063,11 @@ if CONSOLE_ENABLED:
                 return [_row_to_dict(r) for r in rows]
 
     @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str):
+    async def get_account_detail(account_id: str, _auth = Depends(require_console_auth)):
         return await get_account(account_id)
 
     @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str):
+    async def delete_account(account_id: str, _auth = Depends(require_console_auth)):
         async with _conn() as conn:
             cur = await conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
             await conn.commit()
@@ -1105,6 +1124,7 @@ if CONSOLE_ENABLED:
 
     @app.get("/", response_class=FileResponse)
     def index():
+        """前端页面不鉴权，由前端 JS 检查 token 并调用 API"""
         path = BASE_DIR / "frontend" / "index.html"
         if not path.exists():
             raise HTTPException(status_code=404, detail="frontend/index.html not found")
