@@ -143,10 +143,10 @@ async def _init_global_client():
     )
     # 为流式响应设置更长的超时
     timeout = httpx.Timeout(
-        connect=1.0,  # 连接超时
+        connect=10.0,  # 连接超时（SOCKS5 代理需要更长时间）
         read=300.0,    # 读取超时(流式响应需要更长时间)
-        write=1.0,    # 写入超时
-        pool=1.0      # 从连接池获取连接的超时时间(关键!)
+        write=10.0,    # 写入超时
+        pool=5.0       # 从连接池获取连接的超时时间
     )
     GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
 
