@@ -265,16 +265,17 @@ async def send_chat_request(
         resp = await client.send(req, stream=True)
         
         if resp.status_code >= 400:
+            import logging
             try:
                 await resp.read()
-                err = resp.text
-            except Exception:
-                err = f"HTTP {resp.status_code}"
+                err = resp.text if resp.text else f"Empty response body"
+            except Exception as e:
+                err = f"Failed to read response: {e}"
+            logging.error(f"Upstream error {resp.status_code}: {err}")
+            logging.error(f"Request URL: {req.url}, Headers: {dict(req.headers)}")
             await resp.aclose()
             if local_client:
                 await client.aclose()
-            import logging
-            logging.error(f"Upstream error {resp.status_code}: {err}")
             raise httpx.HTTPError(f"Upstream error {resp.status_code}: {err}")
         
         parser = AwsEventStreamParser()
