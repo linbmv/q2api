@@ -343,8 +343,6 @@ async def send_chat_request(
         resp = await client.send(req, stream=True)
         
         if resp.status_code >= 400:
-            import logging
-
             # Read error body safely in async streaming mode
             try:
                 raw = await resp.aread()
