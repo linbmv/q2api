@@ -43,9 +43,9 @@ def reset_all_accounts():
             WHERE enabled=0
         """, (now,))
         conn.commit()
-        
-        print(f"✓ 已重新启用 {disabled_count} 个账号")
-        print("✓ 保留了所有账号的错误和成功次数")
+
+        print(f"[OK] 已重新启用 {disabled_count} 个账号")
+        print("[OK] 保留了所有账号的错误和成功次数")
         
         # 显示更新后的状态
         cursor.execute("""
