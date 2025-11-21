@@ -8,7 +8,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 OLD_DB_PATH = BASE_DIR / "data" / "data.sqlite3"
-NEW_DB_PATH = BASE_DIR / "data.sqlite3"
+NEW_DB_PATH = BASE_DIR / "data" / "data.sqlite3"
 
 def migrate():
     if OLD_DB_PATH.exists():

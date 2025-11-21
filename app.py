@@ -25,7 +25,7 @@ from tokenizer import count_tokens
 # ------------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data.sqlite3"
+DB_PATH = BASE_DIR / "data" / "data.sqlite3"
 
 load_dotenv(BASE_DIR / ".env")
 

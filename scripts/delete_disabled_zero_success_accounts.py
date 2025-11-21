@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "data.sqlite3"
+DB_PATH = BASE_DIR / "data" / "data.sqlite3"
 
 
 def delete_disabled_accounts() -> int:

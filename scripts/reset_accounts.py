@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data.sqlite3"
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "data.sqlite3"
 
 
 def reset_all_accounts():
