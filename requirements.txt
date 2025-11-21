@@ -5,3 +5,4 @@ python-dotenv==1.0.1
 httpx==0.28.1
 httpx[socks]==0.28.1
 aiosqlite==0.20.0
+tiktoken==0.8.0

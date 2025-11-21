@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List, Set
 
+from tokenizer import count_tokens
+
 logger = logging.getLogger(__name__)
 
 def _load_claude_parser():
@@ -155,10 +157,9 @@ class ClaudeStreamHandler:
             yield build_content_block_stop(self.content_block_index)
             self.content_block_stop_sent = True
 
-        # Calculate output tokens (approximate)
+        # Calculate output tokens using tiktoken
         full_text = "".join(self.response_buffer)
         full_tool_input = "".join(self.all_tool_inputs)
-        # Simple approximation: 4 chars per token
-        output_tokens = max(1, (len(full_text) + len(full_tool_input)) // 4)
+        output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
 
         yield build_message_stop(self.input_tokens, output_tokens, "end_turn")

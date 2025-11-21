@@ -18,12 +18,14 @@ from dotenv import load_dotenv
 import httpx
 import aiosqlite
 
+from tokenizer import count_tokens
+
 # ------------------------------------------------------------------------------
 # Bootstrap
 # ------------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "data.sqlite3"
+DB_PATH = BASE_DIR / "data.sqlite3"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -143,9 +145,9 @@ async def _init_global_client():
     )
     # 为流式响应设置更长的超时
     timeout = httpx.Timeout(
-        connect=10.0,  # 连接超时（SOCKS5 代理需要更长时间）
+        connect=5.0,   # 连接超时
         read=300.0,    # 读取超时(流式响应需要更长时间)
-        write=10.0,    # 写入超时
+        write=5.0,     # 写入超时
         pool=5.0       # 从连接池获取连接的超时时间
     )
     GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
@@ -498,7 +500,12 @@ async def require_account(
 # OpenAI-compatible Chat endpoint
 # ------------------------------------------------------------------------------
 
-def _openai_non_streaming_response(text: str, model: Optional[str]) -> Dict[str, Any]:
+def _openai_non_streaming_response(
+    text: str,
+    model: Optional[str],
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+) -> Dict[str, Any]:
     created = int(time.time())
     return {
         "id": f"chatcmpl-{uuid.uuid4()}",
@@ -516,9 +523,9 @@ def _openai_non_streaming_response(text: str, model: Optional[str]) -> Dict[str,
             }
         ],
         "usage": {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
@@ -526,34 +533,33 @@ def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 @app.post("/v1/messages/count_tokens")
-async def count_tokens(req: ClaudeRequest):
+async def count_tokens_endpoint(req: ClaudeRequest):
     """
-    Claude token counting endpoint (approximation).
+    Claude token counting endpoint - 使用 tiktoken 精确计数
     """
-    # 简单估算：每个字符约 0.25 token
-    total_chars = 0
+    text_to_count = ""
 
     if req.system:
         if isinstance(req.system, str):
-            total_chars += len(req.system)
+            text_to_count += req.system
         elif isinstance(req.system, list):
             for b in req.system:
                 if isinstance(b, dict) and b.get("type") == "text":
-                    total_chars += len(b.get("text", ""))
+                    text_to_count += b.get("text", "")
 
     for msg in req.messages:
         content = msg.content
         if isinstance(content, str):
-            total_chars += len(content)
+            text_to_count += content
         elif isinstance(content, list):
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
-                        total_chars += len(block.get("text", ""))
+                        text_to_count += block.get("text", "")
 
-    estimated_tokens = int(total_chars * 0.25)
+    tokens = count_tokens(text_to_count)
 
-    return {"input_tokens": estimated_tokens}
+    return {"input_tokens": tokens}
 
 @app.post("/v1/messages")
 async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(require_account)):
@@ -571,55 +577,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         logging.error(f"Request conversion failed: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
-    # 2. Send upstream
-    async def _send_upstream_raw() -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any, Optional[AsyncGenerator[Any, None]]]:
-        access = account.get("accessToken")
-        if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
-            if not access:
-                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-        
-        # We use the modified send_chat_request which accepts raw_payload
-        # and returns (text, text_stream, tracker, event_stream)
-        return await send_chat_request(
-            access_token=access,
-            messages=[], # Not used when raw_payload is present
-            model=req.model,
-            stream=req.stream,
-            client=GLOBAL_CLIENT,
-            raw_payload=aq_request
-        )
-
-    try:
-        _, _, tracker, event_stream = await _send_upstream_raw()
-        
-        if not req.stream:
-            # Non-streaming: we need to consume the stream and build response
-            # But wait, send_chat_request with stream=False returns text, but we need structured response
-            # Actually, for Claude format, we might want to parse the events even for non-streaming
-            # to get tool calls etc correctly.
-            # However, our modified send_chat_request returns event_stream if raw_payload is used AND stream=True?
-            # Let's check replicate.py modification.
-            # If stream=False, it returns text. But text might not be enough for tool calls.
-            # For simplicity, let's force stream=True internally and aggregate if req.stream is False.
-            pass
-    except Exception as e:
-        await _update_stats(account["id"], False)
-        raise
-
-    # We always use streaming upstream to handle events properly
-    try:
-        # Force stream=True for upstream to get events
-        # But wait, send_chat_request logic: if stream=True, returns event_stream
-        # We need to call it with stream=True
-        pass
-    except:
-        pass
-        
-    # Re-implementing logic to be cleaner
-    
-    # Always stream from upstream to get full event details
+    # 2. Send upstream - always stream to get full event details
     event_iter = None
     try:
         access = account.get("accessToken")
@@ -641,9 +599,25 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
              raise HTTPException(status_code=502, detail="No event stream returned")
 
         # Handler
-        # Estimate input tokens (simple count or 0)
-        # For now 0 or simple len
-        input_tokens = 0
+        # Calculate input tokens
+        text_to_count = ""
+        if req.system:
+            if isinstance(req.system, str):
+                text_to_count += req.system
+            elif isinstance(req.system, list):
+                for item in req.system:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_to_count += item.get("text", "")
+
+        for msg in req.messages:
+            if isinstance(msg.content, str):
+                text_to_count += msg.content
+            elif isinstance(msg.content, list):
+                for item in msg.content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_to_count += item.get("text", "")
+
+        input_tokens = count_tokens(text_to_count)
         handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens)
 
         async def event_generator():
@@ -670,7 +644,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             # But to be nice, let's try to support non-streaming by consuming the generator
             
             content_blocks = []
-            usage = {"input_tokens": 0, "output_tokens": 0}
+            usage = {"input_tokens": input_tokens, "output_tokens": 0}
             stop_reason = None
             
             # We need to parse the SSE strings back to objects... inefficient but works
@@ -770,9 +744,21 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
 
     if not do_stream:
         try:
+            # Calculate prompt tokens
+            prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
+            prompt_tokens = count_tokens(prompt_text)
+
             text, _, tracker = await _send_upstream(stream=False)
             await _update_stats(account["id"], bool(text))
-            return JSONResponse(content=_openai_non_streaming_response(text or "", model))
+
+            completion_tokens = count_tokens(text or "")
+
+            return JSONResponse(content=_openai_non_streaming_response(
+                text or "",
+                model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens
+            ))
         except Exception as e:
             await _update_stats(account["id"], False)
             raise
@@ -783,19 +769,17 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
         
         it = None
         try:
+            # Calculate prompt tokens
+            prompt_text = "".join([m.content for m in req.messages if isinstance(m.content, str)])
+            prompt_tokens = count_tokens(prompt_text)
+
             _, it, tracker = await _send_upstream(stream=True)
             assert it is not None
-            try:
-                first_piece = await it.__anext__()
-            except StopAsyncIteration:
-                await _update_stats(account["id"], False)
-                raise HTTPException(status_code=502, detail="No content from upstream")
-            if not first_piece:
-                await _update_stats(account["id"], False)
-                raise HTTPException(status_code=502, detail="No content from upstream")
-            
+
             async def event_gen() -> AsyncGenerator[str, None]:
+                completion_text = ""
                 try:
+                    # Send role first
                     yield _sse_format({
                         "id": stream_id,
                         "object": "chat.completion.chunk",
@@ -803,15 +787,11 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                         "model": model_used,
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                     })
-                    yield _sse_format({
-                        "id": stream_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_used,
-                        "choices": [{"index": 0, "delta": {"content": first_piece}, "finish_reason": None}],
-                    })
+
+                    # Stream content
                     async for piece in it:
                         if piece:
+                            completion_text += piece
                             yield _sse_format({
                                 "id": stream_id,
                                 "object": "chat.completion.chunk",
@@ -819,12 +799,20 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                                 "model": model_used,
                                 "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
                             })
+
+                    # Send stop and usage
+                    completion_tokens = count_tokens(completion_text)
                     yield _sse_format({
                         "id": stream_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_used,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        }
                     })
                     yield "data: [DONE]\n\n"
                     await _update_stats(account["id"], True)
@@ -1022,7 +1010,7 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate):
+    async def create_account(body: AccountCreate, _auth = Depends(require_console_auth)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
@@ -1076,7 +1064,7 @@ if CONSOLE_ENABLED:
             return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate):
+    async def update_account(account_id: str, body: AccountUpdate, _auth = Depends(require_console_auth)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1113,7 +1101,7 @@ if CONSOLE_ENABLED:
                 return _row_to_dict(row)
 
     @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str):
+    async def manual_refresh(account_id: str, _auth = Depends(require_console_auth)):
         return await refresh_access_token_in_db(account_id)
 
     # ------------------------------------------------------------------------------
