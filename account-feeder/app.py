@@ -23,6 +23,7 @@ load_dotenv()
 # 配置
 PORT = int(os.getenv("FEEDER_PORT", "8001"))
 API_SERVER = os.getenv("API_SERVER", "http://localhost:8000")
+API_SERVER_PASSWORD = os.getenv("API_SERVER_PASSWORD")
 
 # OIDC 端点
 OIDC_BASE = "https://oidc.us-east-1.amazonaws.com"
@@ -235,11 +236,15 @@ async def auth_claim(auth_id: str):
             "enabled": False,
         }
 
+        headers = {"content-type": "application/json"}
+        if API_SERVER_PASSWORD:
+            headers["Authorization"] = f"Bearer {API_SERVER_PASSWORD}"
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{API_SERVER}/v2/accounts",
                 json=account_data,
-                headers={"content-type": "application/json"},
+                headers=headers,
             )
             r.raise_for_status()
             account = r.json()
@@ -275,11 +280,15 @@ async def create_account(account: AccountCreate):
         # 包装成列表以调用新的批量接口
         batch_request = {"accounts": [account_data]}
 
+        headers = {"content-type": "application/json"}
+        if API_SERVER_PASSWORD:
+            headers["Authorization"] = f"Bearer {API_SERVER_PASSWORD}"
+
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
                 f"{API_SERVER}/v2/accounts/feed",
                 json=batch_request,
-                headers={"content-type": "application/json"},
+                headers=headers,
             )
             r.raise_for_status()
             return r.json()
@@ -297,11 +306,15 @@ async def create_account(account: AccountCreate):
 async def batch_create_accounts(request: BatchCreateRequest):
     """批量创建账号（调用主服务统一feed接口）"""
     try:
+        headers = {"content-type": "application/json"}
+        if API_SERVER_PASSWORD:
+            headers["Authorization"] = f"Bearer {API_SERVER_PASSWORD}"
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             r = await client.post(
                 f"{API_SERVER}/v2/accounts/feed",
                 json={"accounts": request.accounts},
-                headers={"content-type": "application/json"},
+                headers=headers,
             )
             r.raise_for_status()
             return r.json()

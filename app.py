@@ -259,10 +259,6 @@ CONSOLE_ENABLED: bool = _is_console_enabled()
 
 # Admin authentication configuration
 ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
-SESSION_EXPIRE_DAYS: int = 30
-
-# Admin session storage: {token: expiration_datetime}
-ADMIN_SESSIONS: Dict[str, datetime] = {}
 
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
@@ -478,27 +474,20 @@ async def require_account(
     key = _extract_bearer(authorization) if authorization else x_api_key
     return await resolve_account_for_key(key)
 
-def verify_admin_session(authorization: Optional[str] = Header(None)) -> bool:
-    """Verify admin session token for console access"""
+def verify_admin_password(authorization: Optional[str] = Header(None)) -> bool:
+    """Verify admin password for console access"""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
             detail={"error": "Unauthorized access", "code": "UNAUTHORIZED"}
         )
 
-    token = authorization[7:]  # Remove "Bearer " prefix
+    password = authorization[7:]  # Remove "Bearer " prefix
 
-    if token not in ADMIN_SESSIONS:
+    if password != ADMIN_PASSWORD:
         raise HTTPException(
             status_code=401,
-            detail={"error": "Invalid session", "code": "SESSION_INVALID"}
-        )
-
-    if datetime.now() > ADMIN_SESSIONS[token]:
-        del ADMIN_SESSIONS[token]
-        raise HTTPException(
-            status_code=401,
-            detail={"error": "Session expired", "code": "SESSION_EXPIRED"}
+            detail={"error": "Invalid password", "code": "INVALID_PASSWORD"}
         )
 
     return True
@@ -924,7 +913,6 @@ class AdminLoginRequest(BaseModel):
 
 class AdminLoginResponse(BaseModel):
     success: bool
-    token: Optional[str] = None
     message: str
 
 async def _create_account_from_tokens(
@@ -969,23 +957,16 @@ if CONSOLE_ENABLED:
     @app.post("/api/login", response_model=AdminLoginResponse)
     async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
         """Admin login endpoint - password only"""
-        if request.password != ADMIN_PASSWORD:
+        if request.password == ADMIN_PASSWORD:
+            return AdminLoginResponse(
+                success=True,
+                message="Login successful"
+            )
+        else:
             return AdminLoginResponse(
                 success=False,
                 message="Invalid password"
             )
-
-        # Generate session token
-        session_token = secrets.token_urlsafe(32)
-
-        # Store session with expiration
-        ADMIN_SESSIONS[session_token] = datetime.now() + timedelta(days=SESSION_EXPIRE_DAYS)
-
-        return AdminLoginResponse(
-            success=True,
-            token=session_token,
-            message="Login successful"
-        )
 
     @app.get("/login", response_class=FileResponse)
     def login_page():
@@ -1000,7 +981,7 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/auth/start")
-    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_session)):
+    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_password)):
         """
         Start device authorization and return verification URL for user login.
         Session lifetime capped at 5 minutes on claim.
@@ -1037,7 +1018,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_session)):
+    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_password)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
@@ -1052,7 +1033,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_session)):
+    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_password)):
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1107,7 +1088,7 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_session)):
+    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_password)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
@@ -1156,7 +1137,7 @@ if CONSOLE_ENABLED:
                 traceback.print_exc()
 
     @app.post("/v2/accounts/feed")
-    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_session)):
+    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_password)):
         """
         统一的投喂接口，接收账号列表，立即存入并后台异步验证。
         """
@@ -1202,23 +1183,23 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/accounts")
-    async def list_accounts(_: bool = Depends(verify_admin_session)):
+    async def list_accounts(_: bool = Depends(verify_admin_password)):
         rows = await _db.fetchall("SELECT * FROM accounts ORDER BY created_at DESC")
         return [_row_to_dict(r) for r in rows]
 
     @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_session)):
+    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
         return await get_account(account_id)
 
     @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str, _: bool = Depends(verify_admin_session)):
+    async def delete_account(account_id: str, _: bool = Depends(verify_admin_password)):
         rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
         if rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_session)):
+    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_password)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1251,7 +1232,7 @@ if CONSOLE_ENABLED:
         return _row_to_dict(row)
 
     @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_session)):
+    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)):
         return await refresh_access_token_in_db(account_id)
 
     # ------------------------------------------------------------------------------

@@ -315,14 +315,14 @@ function api(path){
 }
 
 // Authentication helpers
-function getAuthToken() {
-  return localStorage.getItem('adminToken');
+function getAuthPassword() {
+  return localStorage.getItem('adminPassword');
 }
 
 function getAuthHeaders() {
-  const token = getAuthToken();
-  if (!token) return {};
-  return { 'Authorization': `Bearer ${token}` };
+  const password = getAuthPassword();
+  if (!password) return {};
+  return { 'Authorization': `Bearer ${password}` };
 }
 
 // Authenticated fetch wrapper
@@ -331,7 +331,7 @@ async function authFetch(url, options = {}) {
   const response = await fetch(url, { ...options, headers });
 
   if (response.status === 401) {
-    localStorage.removeItem('adminToken');
+    localStorage.removeItem('adminPassword');
     window.location.href = '/login';
     throw new Error('Unauthorized');
   }
@@ -790,8 +790,8 @@ async function send() {
 
 window.addEventListener('DOMContentLoaded', () => {
   // Check authentication first
-  const token = getAuthToken();
-  if (!token) {
+  const password = getAuthPassword();
+  if (!password) {
     window.location.href = '/login';
     return;
   }

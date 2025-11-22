@@ -17,10 +17,3 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    networks:
-      - q2api-network
-
-networks:
-  q2api-network:
-    external: true
-    name: v2_default

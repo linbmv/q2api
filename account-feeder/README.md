@@ -70,6 +70,9 @@ API_SERVER=http://localhost:8000
 
 # HTTP代理设置（可选）
 HTTP_PROXY=""
+
+# 主服务管理员密码（如果主服务配置了 ADMIN_PASSWORD）
+API_SERVER_PASSWORD=
 ```
 
 **重要：** 确保 `API_SERVER` 配置正确，指向主服务地址！
