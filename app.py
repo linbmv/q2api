@@ -3,6 +3,8 @@ import json
 import logging
 import uuid
 import time
+
+logger = logging.getLogger(__name__)
 import asyncio
 import importlib.util
 import random
@@ -165,7 +167,12 @@ async def _close_global_client():
 async def _ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as conn:
+        # Performance tuning PRAGMAs
         await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA cache_size = -65536; -- 64MB")
+        await conn.execute("PRAGMA temp_store = MEMORY;")
+
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS accounts (
@@ -196,11 +203,37 @@ async def _ensure_db():
                     await conn.execute("ALTER TABLE accounts ADD COLUMN success_count INTEGER DEFAULT 0")
         except Exception:
             pass
+
+        # Drop old single-column indexes to reduce write amplification
+        try:
+            await conn.execute("DROP INDEX IF EXISTS idx_accounts_enabled;")
+            await conn.execute("DROP INDEX IF EXISTS idx_accounts_created_at;")
+            await conn.execute("DROP INDEX IF EXISTS idx_accounts_success_count;")
+        except Exception:
+            pass
+
+        # Create composite indexes for actual query patterns
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled_created ON accounts (enabled, created_at DESC);")
+
         await conn.commit()
 
-def _conn() -> aiosqlite.Connection:
-    """Create a new database connection. Must be used with async with."""
-    return aiosqlite.connect(DB_PATH)
+class _OptimizedConnection:
+    """Context manager that returns a performance-tuned SQLite connection."""
+    async def __aenter__(self):
+        self.conn = await aiosqlite.connect(DB_PATH)
+        # Apply performance PRAGMAs to each connection
+        await self.conn.execute("PRAGMA journal_mode=WAL;")
+        await self.conn.execute("PRAGMA synchronous = NORMAL;")
+        await self.conn.execute("PRAGMA cache_size = -65536;")
+        await self.conn.execute("PRAGMA temp_store = MEMORY;")
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.conn.close()
+
+def _conn():
+    """Create a new database connection with performance tuning. Must be used with async with."""
+    return _OptimizedConnection()
 
 def _row_to_dict(r: aiosqlite.Row) -> Dict[str, Any]:
     d = dict(r)
@@ -654,19 +687,28 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             
             # Let's implement a basic accumulator from the SSE stream
             final_content = []
-            
-            async for sse_line in event_generator():
-                if sse_line.startswith("data: "):
-                    data_str = sse_line[6:].strip()
-                    if data_str == "[DONE]": continue
+
+            async for sse_chunk in event_generator():
+                # Each chunk can have multiple lines ('event:', 'data:').
+                # Process ALL 'data:' lines, not just the first one.
+                for line in sse_chunk.strip().split('\n'):
+                    if not line.startswith("data:"):
+                        continue
+
+                    data_str = line[6:].strip()
+                    if not data_str or data_str == "[DONE]":
+                        continue
+
                     try:
                         data = json.loads(data_str)
                         dtype = data.get("type")
+
                         if dtype == "content_block_start":
                             idx = data.get("index", 0)
                             while len(final_content) <= idx:
                                 final_content.append(None)
                             final_content[idx] = data.get("content_block")
+
                         elif dtype == "content_block_delta":
                             idx = data.get("index", 0)
                             delta = data.get("delta", {})
@@ -674,35 +716,56 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                                 if delta.get("type") == "text_delta":
                                     final_content[idx]["text"] += delta.get("text", "")
                                 elif delta.get("type") == "input_json_delta":
-                                    # We need to accumulate partial json
-                                    # But wait, content_block for tool_use has 'input' as dict?
-                                    # No, in start it is empty.
-                                    # We need to track partial json string
                                     if "partial_json" not in final_content[idx]:
                                         final_content[idx]["partial_json"] = ""
                                     final_content[idx]["partial_json"] += delta.get("partial_json", "")
+
                         elif dtype == "content_block_stop":
                             idx = data.get("index", 0)
-                            # If tool use, parse json
-                            if final_content[idx] and final_content[idx]["type"] == "tool_use":
+                            if final_content[idx] and final_content[idx].get("type") == "tool_use":
                                 if "partial_json" in final_content[idx]:
                                     try:
                                         final_content[idx]["input"] = json.loads(final_content[idx]["partial_json"])
-                                    except:
-                                        pass
+                                    except json.JSONDecodeError:
+                                        # Keep partial if invalid
+                                        final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
                                     del final_content[idx]["partial_json"]
+
                         elif dtype == "message_delta":
-                            usage = data.get("usage", usage)
+                            # Merge usage counters instead of replacing
+                            delta_usage = data.get("usage", {})
+                            if delta_usage:
+                                usage.update(delta_usage)
+                                # Recalculate total_tokens
+                                usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
                             stop_reason = data.get("delta", {}).get("stop_reason")
-                    except:
+
+                    except json.JSONDecodeError:
+                        # Ignore lines that are not valid JSON
                         pass
-            
+                    except Exception as e:
+                        # Log unexpected errors but don't crash
+                        logger.warning(f"Error processing SSE event: {e}")
+                        pass
+
+            # Final assembly
+            final_content_cleaned = []
+            for c in final_content:
+                if c is not None:
+                    # Remove internal state like 'partial_json' before returning
+                    c.pop("partial_json", None)
+                    final_content_cleaned.append(c)
+
+            # Ensure total_tokens is always present
+            if "total_tokens" not in usage:
+                usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+
             return {
                 "id": f"msg_{uuid.uuid4()}",
                 "type": "message",
                 "role": "assistant",
                 "model": req.model,
-                "content": [c for c in final_content if c is not None],
+                "content": final_content_cleaned,
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": usage
