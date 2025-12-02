@@ -214,6 +214,7 @@ async def _ensure_db():
 
         # Create composite indexes for actual query patterns
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled_created ON accounts (enabled, created_at DESC);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled_success ON accounts (enabled, success_count DESC);")
 
         await conn.commit()
 
@@ -617,7 +618,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         if not access:
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
-        
+
         # We call with stream=True to get the event iterator
         _, _, tracker, event_iter = await send_chat_request(
             access_token=access,
@@ -627,7 +628,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             client=GLOBAL_CLIENT,
             raw_payload=aq_request
         )
-        
+
         if not event_iter:
              raise HTTPException(status_code=502, detail="No event stream returned")
 
@@ -653,8 +654,26 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         input_tokens = count_tokens(text_to_count)
         handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens)
 
+        # Try to get the first event to ensure the connection is valid
+        # This allows us to return proper HTTP error codes before starting the stream
+        first_event = None
+        try:
+            first_event = await event_iter.__anext__()
+        except StopAsyncIteration:
+            raise HTTPException(status_code=502, detail="Empty response from upstream")
+        except Exception as e:
+            # If we get an error before the first event, we can still return proper status code
+            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+
         async def event_generator():
             try:
+                # Process the first event we already fetched
+                if first_event:
+                    event_type, payload = first_event
+                    async for sse in handler.handle_event(event_type, payload):
+                        yield sse
+
+                # Process remaining events
                 async for event_type, payload in event_iter:
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
@@ -1106,12 +1125,21 @@ if CONSOLE_ENABLED:
                 return _row_to_dict(row)
 
     @app.get("/v2/accounts")
-    async def list_accounts(_auth = Depends(require_console_auth)):
+    async def list_accounts(_auth = Depends(require_console_auth), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
+        query = "SELECT * FROM accounts"
+        params = []
+        if enabled is not None:
+            query += " WHERE enabled=?"
+            params.append(1 if enabled else 0)
+        sort_field = "created_at" if sort_by not in ["created_at", "success_count"] else sort_by
+        order = "DESC" if sort_order.lower() == "desc" else "ASC"
+        query += f" ORDER BY {sort_field} {order}"
         async with _conn() as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT * FROM accounts ORDER BY created_at DESC") as cursor:
+            async with conn.execute(query, tuple(params) if params else ()) as cursor:
                 rows = await cursor.fetchall()
-                return [_row_to_dict(r) for r in rows]
+                accounts = [_row_to_dict(r) for r in rows]
+                return {"accounts": accounts, "count": len(accounts)}
 
     @app.get("/v2/accounts/{account_id}")
     async def get_account_detail(account_id: str, _auth = Depends(require_console_auth)):
