@@ -747,6 +747,9 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                         if final_content[idx]:
                             if delta.get("type") == "text_delta":
                                 final_content[idx]["text"] += delta.get("text", "")
+                            elif delta.get("type") == "thinking_delta":
+                                final_content[idx].setdefault("thinking", "")
+                                final_content[idx]["thinking"] += delta.get("thinking", "")
                             elif delta.get("type") == "input_json_delta":
                                 if "partial_json" not in final_content[idx]:
                                     final_content[idx]["partial_json"] = ""

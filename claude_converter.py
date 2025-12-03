@@ -25,6 +25,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 THINKING_HINT = "<antml:thinking_mode>interleaved</antml:thinking_mode><antml:max_thinking_length>16000</antml:max_thinking_length>"
+THINKING_START_TAG = "<thinking>"
+THINKING_END_TAG = "</thinking>"
+
+def _wrap_thinking_content(thinking_text: str) -> str:
+    """Wrap thinking text with the XML tag expected by Amazon Q."""
+    return f"{THINKING_START_TAG}{thinking_text}{THINKING_END_TAG}"
 
 def is_thinking_mode_enabled(thinking_cfg: Optional[Any]) -> bool:
     """Detect whether the client enabled thinking mode."""
@@ -43,15 +49,6 @@ def is_thinking_mode_enabled(thinking_cfg: Optional[Any]) -> bool:
             return enabled_flag
         budget = thinking_cfg.get("budget_tokens")
         if isinstance(budget, (int, float)) and budget > 0:
-            return True
-    return False
-
-def _contains_tool_content(content: Union[str, List[Dict[str, Any]]]) -> bool:
-    """Return True if the user message content contains tool result/call payloads."""
-    if not isinstance(content, list):
-        return False
-    for block in content:
-        if isinstance(block, dict) and block.get("type") in {"tool_result", "tool_use"}:
             return True
     return False
 
@@ -88,8 +85,11 @@ def extract_text_from_content(content: Union[str, List[Dict[str, Any]]]) -> str:
         parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                block_type = block.get("type")
+                if block_type == "text":
                     parts.append(block.get("text", ""))
+                elif block_type == "thinking":
+                    parts.append(_wrap_thinking_content(block.get("thinking", "")))
         return "\n".join(parts)
     return ""
 
@@ -186,7 +186,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
             text_content = ""
             tool_results = None
             images = extract_images_from_content(content)
-            should_append_hint = thinking_enabled and not _contains_tool_content(content)
+            should_append_hint = thinking_enabled
             
             if isinstance(content, list):
                 text_parts = []
@@ -195,6 +195,8 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
                         btype = block.get("type")
                         if btype == "text":
                             text_parts.append(block.get("text", ""))
+                        elif btype == "thinking":
+                            text_parts.append(_wrap_thinking_content(block.get("thinking", "")))
                         elif btype == "tool_result":
                             if tool_results is None:
                                 tool_results = []
@@ -334,6 +336,8 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                     btype = block.get("type")
                     if btype == "text":
                         text_parts.append(block.get("text", ""))
+                    elif btype == "thinking":
+                        text_parts.append(_wrap_thinking_content(block.get("thinking", "")))
                     elif btype == "tool_result":
                         has_tool_result = True
                         if tool_results is None:
@@ -371,7 +375,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         else:
             prompt_content = extract_text_from_content(content)
 
-        if thinking_enabled and not _contains_tool_content(content):
+        if thinking_enabled:
             prompt_content = _append_thinking_hint(prompt_content)
             
     # 3. Context

@@ -124,6 +124,7 @@ class ClaudeStreamHandler:
                                     yield build_content_block_start(self.content_block_index, "text")
                                     self.content_block_start_sent = True
                                     self.content_block_started = True
+                                    self.content_block_stop_sent = False
                                 self.response_buffer.append(before_text)
                                 yield build_content_block_delta(self.content_block_index, before_text)
 
@@ -148,6 +149,7 @@ class ClaudeStreamHandler:
                                 yield build_content_block_start(self.content_block_index, "text")
                                 self.content_block_start_sent = True
                                 self.content_block_started = True
+                                self.content_block_stop_sent = False
                             self.response_buffer.append(remaining)
                             yield build_content_block_delta(self.content_block_index, remaining)
                             self.think_buffer = ""
@@ -159,7 +161,12 @@ class ClaudeStreamHandler:
                             # Send thinking content
                             thinking_text = self.think_buffer[pos:think_end]
                             if thinking_text:
-                                yield build_content_block_delta(self.content_block_index, thinking_text)
+                                yield build_content_block_delta(
+                                    self.content_block_index,
+                                    thinking_text,
+                                    delta_type="thinking_delta",
+                                    field_name="thinking"
+                                )
 
                             # Close thinking block
                             yield build_content_block_stop(self.content_block_index)
@@ -170,7 +177,12 @@ class ClaudeStreamHandler:
                         else:
                             # No </thinking> yet, send as thinking
                             remaining = self.think_buffer[pos:]
-                            yield build_content_block_delta(self.content_block_index, remaining)
+                            yield build_content_block_delta(
+                                self.content_block_index,
+                                remaining,
+                                delta_type="thinking_delta",
+                                field_name="thinking"
+                            )
                             self.think_buffer = ""
                             break
 
