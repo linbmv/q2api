@@ -661,9 +661,18 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             first_event = await event_iter.__anext__()
         except StopAsyncIteration:
             raise HTTPException(status_code=502, detail="Empty response from upstream")
+        except httpx.HTTPError as e:
+            # Parse upstream error and return appropriate status code
+            error_msg = str(e)
+            if "500" in error_msg or "InternalServerException" in error_msg:
+                raise HTTPException(status_code=502, detail=f"Upstream server error: {error_msg}")
+            elif "400" in error_msg or "401" in error_msg or "403" in error_msg:
+                raise HTTPException(status_code=502, detail=f"Upstream authentication error: {error_msg}")
+            else:
+                raise HTTPException(status_code=502, detail=f"Upstream error: {error_msg}")
         except Exception as e:
-            # If we get an error before the first event, we can still return proper status code
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+            # Other unexpected errors
+            raise HTTPException(status_code=502, detail=f"Unexpected error: {str(e)}")
 
         async def event_generator():
             try:
