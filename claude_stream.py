@@ -3,10 +3,42 @@ import logging
 import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List, Set
-
-from tokenizer import count_tokens
+import tiktoken
 
 logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------------------
+# Tokenizer
+# ------------------------------------------------------------------------------
+
+try:
+    # cl100k_base is used by gpt-4, gpt-3.5-turbo, text-embedding-ada-002
+    ENCODING = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    ENCODING = None
+
+THINKING_START_TAG = "<thinking>"
+THINKING_END_TAG = "</thinking>"
+
+def _pending_tag_suffix(buffer: str, tag: str) -> int:
+    """Length of the suffix of buffer that matches the prefix of tag (for partial matches)."""
+    if not buffer or not tag:
+        return 0
+    max_len = min(len(buffer), len(tag) - 1)
+    for length in range(max_len, 0, -1):
+        if buffer[-length:] == tag[:length]:
+            return length
+    return 0
+
+def count_tokens(text: str) -> int:
+    """Counts tokens with tiktoken."""
+    if not text or not ENCODING:
+        return 0
+    return len(ENCODING.encode(text))
+
+# ------------------------------------------------------------------------------
+# Dynamic Loader
+# ------------------------------------------------------------------------------
 
 def _load_claude_parser():
     """Dynamically load claude_parser module."""
@@ -49,7 +81,7 @@ class ClaudeStreamHandler:
         self.content_block_stop_sent: bool = False
         self.message_start_sent: bool = False
         self.conversation_id: Optional[str] = None
-        
+
         # Tool use state
         self.current_tool_use: Optional[Dict[str, Any]] = None
         self.tool_input_buffer: List[str] = []
@@ -57,6 +89,11 @@ class ClaudeStreamHandler:
         self.tool_name: Optional[str] = None
         self._processed_tool_use_ids: Set[str] = set()
         self.all_tool_inputs: List[str] = []
+
+        # Think tag state
+        self.in_think_block: bool = False
+        self.think_buffer: str = ""
+        self.pending_start_tag_chars: int = 0
 
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
@@ -73,24 +110,119 @@ class ClaudeStreamHandler:
         # 2. Content Block Delta (assistantResponseEvent)
         elif event_type == "assistantResponseEvent":
             content = payload.get("content", "")
-            
+
             # Close any open tool use block
             if self.current_tool_use and not self.content_block_stop_sent:
                 yield build_content_block_stop(self.content_block_index)
                 self.content_block_stop_sent = True
                 self.current_tool_use = None
 
-            # Start content block if needed
-            if not self.content_block_start_sent:
-                self.content_block_index += 1
-                yield build_content_block_start(self.content_block_index, "text")
-                self.content_block_start_sent = True
-                self.content_block_started = True
-
-            # Send delta
+            # Process content with think tag detection
             if content:
-                self.response_buffer.append(content)
-                yield build_content_block_delta(self.content_block_index, content)
+                self.think_buffer += content
+                while self.think_buffer:
+                    if self.pending_start_tag_chars > 0:
+                        if len(self.think_buffer) < self.pending_start_tag_chars:
+                            self.pending_start_tag_chars -= len(self.think_buffer)
+                            self.think_buffer = ""
+                            break
+                        else:
+                            self.think_buffer = self.think_buffer[self.pending_start_tag_chars:]
+                            self.pending_start_tag_chars = 0
+                            if not self.think_buffer:
+                                break
+                            continue
+
+                    if not self.in_think_block:
+                        think_start = self.think_buffer.find(THINKING_START_TAG)
+                        if think_start == -1:
+                            pending = _pending_tag_suffix(self.think_buffer, THINKING_START_TAG)
+                            if pending == len(self.think_buffer) and pending > 0:
+                                if self.content_block_start_sent:
+                                    yield build_content_block_stop(self.content_block_index)
+                                    self.content_block_stop_sent = True
+                                    self.content_block_start_sent = False
+
+                                self.content_block_index += 1
+                                yield build_content_block_start(self.content_block_index, "thinking")
+                                self.content_block_start_sent = True
+                                self.content_block_started = True
+                                self.content_block_stop_sent = False
+                                self.in_think_block = True
+                                self.pending_start_tag_chars = len(THINKING_START_TAG) - pending
+                                self.think_buffer = ""
+                                break
+
+                            emit_len = len(self.think_buffer) - pending
+                            if emit_len <= 0:
+                                break
+                            text_chunk = self.think_buffer[:emit_len]
+                            if text_chunk:
+                                if not self.content_block_start_sent:
+                                    self.content_block_index += 1
+                                    yield build_content_block_start(self.content_block_index, "text")
+                                    self.content_block_start_sent = True
+                                    self.content_block_started = True
+                                    self.content_block_stop_sent = False
+                                self.response_buffer.append(text_chunk)
+                                yield build_content_block_delta(self.content_block_index, text_chunk)
+                            self.think_buffer = self.think_buffer[emit_len:]
+                        else:
+                            before_text = self.think_buffer[:think_start]
+                            if before_text:
+                                if not self.content_block_start_sent:
+                                    self.content_block_index += 1
+                                    yield build_content_block_start(self.content_block_index, "text")
+                                    self.content_block_start_sent = True
+                                    self.content_block_started = True
+                                    self.content_block_stop_sent = False
+                                self.response_buffer.append(before_text)
+                                yield build_content_block_delta(self.content_block_index, before_text)
+                            self.think_buffer = self.think_buffer[think_start + len(THINKING_START_TAG):]
+
+                            if self.content_block_start_sent:
+                                yield build_content_block_stop(self.content_block_index)
+                                self.content_block_stop_sent = True
+                                self.content_block_start_sent = False
+
+                            self.content_block_index += 1
+                            yield build_content_block_start(self.content_block_index, "thinking")
+                            self.content_block_start_sent = True
+                            self.content_block_started = True
+                            self.content_block_stop_sent = False
+                            self.in_think_block = True
+                            self.pending_start_tag_chars = 0
+                    else:
+                        think_end = self.think_buffer.find(THINKING_END_TAG)
+                        if think_end == -1:
+                            pending = _pending_tag_suffix(self.think_buffer, THINKING_END_TAG)
+                            emit_len = len(self.think_buffer) - pending
+                            if emit_len <= 0:
+                                break
+                            thinking_chunk = self.think_buffer[:emit_len]
+                            if thinking_chunk:
+                                yield build_content_block_delta(
+                                    self.content_block_index,
+                                    thinking_chunk,
+                                    delta_type="thinking_delta",
+                                    field_name="thinking"
+                                )
+                            self.think_buffer = self.think_buffer[emit_len:]
+                        else:
+                            thinking_chunk = self.think_buffer[:think_end]
+                            if thinking_chunk:
+                                yield build_content_block_delta(
+                                    self.content_block_index,
+                                    thinking_chunk,
+                                    delta_type="thinking_delta",
+                                    field_name="thinking"
+                                )
+                            self.think_buffer = self.think_buffer[think_end + len(THINKING_END_TAG):]
+
+                            yield build_content_block_stop(self.content_block_index)
+                            self.content_block_stop_sent = True
+                            self.content_block_start_sent = False
+                            self.in_think_block = False
 
         # 3. Tool Use (toolUseEvent)
         elif event_type == "toolUseEvent":
@@ -157,9 +289,11 @@ class ClaudeStreamHandler:
             yield build_content_block_stop(self.content_block_index)
             self.content_block_stop_sent = True
 
-        # Calculate output tokens using tiktoken
+        # Calculate output tokens (approximate)
         full_text = "".join(self.response_buffer)
         full_tool_input = "".join(self.all_tool_inputs)
+        # Simple approximation: 4 chars per token
+        # output_tokens = max(1, (len(full_text) + len(full_tool_input)) // 4)
         output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
 
         yield build_message_stop(self.input_tokens, output_tokens, "end_turn")

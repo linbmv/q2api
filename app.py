@@ -1,14 +1,13 @@
 import os
 import json
-import logging
+import traceback
 import uuid
 import time
-
-logger = logging.getLogger(__name__)
 import asyncio
 import importlib.util
 import random
-import hmac
+import secrets
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 
@@ -18,16 +17,34 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Fil
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
-import aiosqlite
+import tiktoken
 
-from tokenizer import count_tokens
+from db import init_db, close_db, row_to_dict
+
+# ------------------------------------------------------------------------------
+# Tokenizer
+# ------------------------------------------------------------------------------
+
+try:
+    # cl100k_base is used by gpt-4, gpt-3.5-turbo, text-embedding-ada-002
+    ENCODING = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    ENCODING = None
+
+def count_tokens(text: str, apply_multiplier: bool = False) -> int:
+    """Counts tokens with tiktoken."""
+    if not text or not ENCODING:
+        return 0
+    token_count = len(ENCODING.encode(text))
+    if apply_multiplier:
+        token_count = int(token_count * TOKEN_COUNT_MULTIPLIER)
+    return token_count
 
 # ------------------------------------------------------------------------------
 # Bootstrap
 # ------------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "data" / "data.sqlite3"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -102,7 +119,8 @@ try:
     convert_claude_to_amazonq_request = _claude_converter.convert_claude_to_amazonq_request
     ClaudeStreamHandler = _claude_stream.ClaudeStreamHandler
 except Exception as e:
-    logging.error(f"Failed to load Claude modules: {e}", exc_info=True)
+    print(f"Failed to load Claude modules: {e}")
+    traceback.print_exc()
     # Define dummy classes to avoid NameError on startup if loading fails
     class ClaudeRequest(BaseModel):
         pass
@@ -121,13 +139,6 @@ def _get_proxies() -> Optional[Dict[str, str]]:
         return {"http": proxy, "https": proxy}
     return None
 
-def _create_proxy_mounts(proxy_url: str):
-    """创建代理传输层,支持 HTTP/HTTPS 和 SOCKS5"""
-    return {
-        "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-        "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
-    }
-
 async def _init_global_client():
     global GLOBAL_CLIENT
     proxies = _get_proxies()
@@ -135,22 +146,25 @@ async def _init_global_client():
     if proxies:
         proxy_url = proxies.get("https") or proxies.get("http")
         if proxy_url:
-            mounts = _create_proxy_mounts(proxy_url)
+            mounts = {
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+            }
     # Increased limits for high concurrency with streaming
     # max_connections: 总连接数上限
     # max_keepalive_connections: 保持活跃的连接数
     # keepalive_expiry: 连接保持时间
     limits = httpx.Limits(
         max_keepalive_connections=60,
-        max_connections=60,  # 60个并发连接
+        max_connections=60,  # 提高到500以支持更高并发
         keepalive_expiry=30.0  # 30秒后释放空闲连接
     )
     # 为流式响应设置更长的超时
     timeout = httpx.Timeout(
-        connect=5.0,   # 连接超时
+        connect=1.0,  # 连接超时
         read=300.0,    # 读取超时(流式响应需要更长时间)
-        write=5.0,     # 写入超时
-        pool=5.0       # 从连接池获取连接的超时时间
+        write=1.0,    # 写入超时
+        pool=1.0      # 从连接池获取连接的超时时间(关键!)
     )
     GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
 
@@ -161,95 +175,20 @@ async def _close_global_client():
         GLOBAL_CLIENT = None
 
 # ------------------------------------------------------------------------------
-# SQLite helpers
+# Database helpers
 # ------------------------------------------------------------------------------
 
+# Database backend instance (initialized on startup)
+_db = None
+
 async def _ensure_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as conn:
-        # Performance tuning PRAGMAs
-        await conn.execute("PRAGMA journal_mode=WAL;")
-        await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA cache_size = -65536; -- 64MB")
-        await conn.execute("PRAGMA temp_store = MEMORY;")
+    """Initialize database backend."""
+    global _db
+    _db = await init_db()
 
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                label TEXT,
-                clientId TEXT,
-                clientSecret TEXT,
-                refreshToken TEXT,
-                accessToken TEXT,
-                other TEXT,
-                last_refresh_time TEXT,
-                last_refresh_status TEXT,
-                created_at TEXT,
-                updated_at TEXT
-            )
-            """
-        )
-        # add columns if missing
-        try:
-            async with conn.execute("PRAGMA table_info(accounts)") as cursor:
-                rows = await cursor.fetchall()
-                cols = [row[1] for row in rows]
-                if "enabled" not in cols:
-                    await conn.execute("ALTER TABLE accounts ADD COLUMN enabled INTEGER DEFAULT 1")
-                if "error_count" not in cols:
-                    await conn.execute("ALTER TABLE accounts ADD COLUMN error_count INTEGER DEFAULT 0")
-                if "success_count" not in cols:
-                    await conn.execute("ALTER TABLE accounts ADD COLUMN success_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        # Drop old single-column indexes to reduce write amplification
-        try:
-            await conn.execute("DROP INDEX IF EXISTS idx_accounts_enabled;")
-            await conn.execute("DROP INDEX IF EXISTS idx_accounts_created_at;")
-            await conn.execute("DROP INDEX IF EXISTS idx_accounts_success_count;")
-        except Exception:
-            pass
-
-        # Create composite indexes for actual query patterns
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled_created ON accounts (enabled, created_at DESC);")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled_success ON accounts (enabled, success_count DESC);")
-
-        await conn.commit()
-
-class _OptimizedConnection:
-    """Context manager that returns a performance-tuned SQLite connection."""
-    async def __aenter__(self):
-        self.conn = await aiosqlite.connect(DB_PATH)
-        # Apply performance PRAGMAs to each connection
-        await self.conn.execute("PRAGMA journal_mode=WAL;")
-        await self.conn.execute("PRAGMA synchronous = NORMAL;")
-        await self.conn.execute("PRAGMA cache_size = -65536;")
-        await self.conn.execute("PRAGMA temp_store = MEMORY;")
-        return self.conn
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.conn.close()
-
-def _conn():
-    """Create a new database connection with performance tuning. Must be used with async with."""
-    return _OptimizedConnection()
-
-def _row_to_dict(r: aiosqlite.Row) -> Dict[str, Any]:
-    d = dict(r)
-    if d.get("other"):
-        try:
-            d["other"] = json.loads(d["other"])
-        except Exception:
-            pass
-    # normalize enabled to bool
-    if "enabled" in d and d["enabled"] is not None:
-        try:
-            d["enabled"] = bool(int(d["enabled"]))
-        except Exception:
-            d["enabled"] = bool(d["enabled"])
-    return d
+def _row_to_dict(r: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert database row to dict with JSON parsing."""
+    return row_to_dict(r)
 
 # _ensure_db() will be called in startup event
 
@@ -261,32 +200,43 @@ async def _refresh_stale_tokens():
     while True:
         try:
             await asyncio.sleep(300)  # 5 minutes
+            if _db is None:
+                print("[Error] Database not initialized, skipping token refresh cycle.")
+                continue
             now = time.time()
-            async with _conn() as conn:
-                conn.row_factory = aiosqlite.Row
-                async with conn.execute("SELECT id, last_refresh_time FROM accounts WHERE enabled=1") as cursor:
-                    rows = await cursor.fetchall()
-                    for row in rows:
-                        acc_id, last_refresh = row[0], row[1]
-                        should_refresh = False
-                        if not last_refresh or last_refresh == "never":
-                            should_refresh = True
-                        else:
-                            try:
-                                last_time = time.mktime(time.strptime(last_refresh, "%Y-%m-%dT%H:%M:%S"))
-                                if now - last_time > 1500:  # 25 minutes
-                                    should_refresh = True
-                            except Exception:
-                                # Malformed or unparsable timestamp; force refresh
-                                should_refresh = True
+            
+            if LAZY_ACCOUNT_POOL_ENABLED:
+                limit = LAZY_ACCOUNT_POOL_SIZE + LAZY_ACCOUNT_POOL_REFRESH_OFFSET
+                order_direction = "DESC" if LAZY_ACCOUNT_POOL_ORDER_DESC else "ASC"
+                query = f"SELECT id, last_refresh_time FROM accounts WHERE enabled=1 ORDER BY {LAZY_ACCOUNT_POOL_ORDER_BY} {order_direction} LIMIT {limit}"
+                rows = await _db.fetchall(query)
+            else:
+                rows = await _db.fetchall("SELECT id, last_refresh_time FROM accounts WHERE enabled=1")
 
-                        if should_refresh:
-                            try:
-                                await refresh_access_token_in_db(acc_id)
-                            except Exception as e:
-                                logging.warning(f"Refresh token failed for account {acc_id}: {e}", exc_info=True)
-        except Exception as e:
-            logging.error(f"Background refresh loop error: {e}", exc_info=True)
+            for row in rows:
+                acc_id, last_refresh = row['id'], row['last_refresh_time']
+                should_refresh = False
+                if not last_refresh or last_refresh == "never":
+                    should_refresh = True
+                else:
+                    try:
+                        last_time = time.mktime(time.strptime(last_refresh, "%Y-%m-%dT%H:%M:%S"))
+                        if now - last_time > 1500:  # 25 minutes
+                            should_refresh = True
+                    except Exception:
+                        # Malformed or unparsable timestamp; force refresh
+                        should_refresh = True
+
+                if should_refresh:
+                    try:
+                        await refresh_access_token_in_db(acc_id)
+                    except Exception:
+                        traceback.print_exc()
+                        # Ignore per-account refresh failure; timestamp/status are recorded inside
+                        pass
+        except Exception:
+            traceback.print_exc()
+            pass
 
 # ------------------------------------------------------------------------------
 # Env and API Key authorization (keys are independent of AWS accounts)
@@ -306,6 +256,18 @@ def _parse_allowed_keys_env() -> List[str]:
 
 ALLOWED_API_KEYS: List[str] = _parse_allowed_keys_env()
 MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
+TOKEN_COUNT_MULTIPLIER: float = float(os.getenv("TOKEN_COUNT_MULTIPLIER", "1.0"))
+
+# Lazy Account Pool settings
+LAZY_ACCOUNT_POOL_ENABLED: bool = os.getenv("LAZY_ACCOUNT_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+LAZY_ACCOUNT_POOL_SIZE: int = int(os.getenv("LAZY_ACCOUNT_POOL_SIZE", "20"))
+LAZY_ACCOUNT_POOL_REFRESH_OFFSET: int = int(os.getenv("LAZY_ACCOUNT_POOL_REFRESH_OFFSET", "10"))
+LAZY_ACCOUNT_POOL_ORDER_BY: str = os.getenv("LAZY_ACCOUNT_POOL_ORDER_BY", "created_at")
+LAZY_ACCOUNT_POOL_ORDER_DESC: bool = os.getenv("LAZY_ACCOUNT_POOL_ORDER_DESC", "false").lower() in ("true", "1", "yes")
+
+# Validate LAZY_ACCOUNT_POOL_ORDER_BY to prevent SQL injection
+if LAZY_ACCOUNT_POOL_ORDER_BY not in ["created_at", "id", "success_count"]:
+    LAZY_ACCOUNT_POOL_ORDER_BY = "created_at"
 
 def _is_console_enabled() -> bool:
     """检查是否启用管理控制台"""
@@ -313,24 +275,9 @@ def _is_console_enabled() -> bool:
     return console_env not in ("false", "0", "no", "disabled")
 
 CONSOLE_ENABLED: bool = _is_console_enabled()
-CONSOLE_TOKEN: Optional[str] = os.getenv("CONSOLE_TOKEN", "").strip() or None
 
-def require_console_auth(authorization: Optional[str] = Header(default=None)):
-    """前端控制台鉴权"""
-    if not CONSOLE_TOKEN:
-        return  # 未设置 token 则不鉴权
-
-    token = None
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-
-    # 使用常量时间比较防止时序攻击
-    if not token or not hmac.compare_digest(token, CONSOLE_TOKEN):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Bearer realm=\"console\""}
-        )
+# Admin authentication configuration
+ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
 
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
@@ -339,11 +286,48 @@ def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
         return token_header.split(" ", 1)[1].strip()
     return token_header.strip()
 
-async def _list_enabled_accounts(conn: aiosqlite.Connection) -> List[Dict[str, Any]]:
-    conn.row_factory = aiosqlite.Row
-    async with conn.execute("SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC") as cursor:
-        rows = await cursor.fetchall()
-        return [_row_to_dict(r) for r in rows]
+async def _list_enabled_accounts(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    if LAZY_ACCOUNT_POOL_ENABLED:
+        order_direction = "DESC" if LAZY_ACCOUNT_POOL_ORDER_DESC else "ASC"
+        query = f"SELECT * FROM accounts WHERE enabled=1 ORDER BY {LAZY_ACCOUNT_POOL_ORDER_BY} {order_direction}"
+        if limit:
+            query += f" LIMIT {limit}"
+        rows = await _db.fetchall(query)
+    else:
+        query = "SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC"
+        if limit:
+            query += f" LIMIT {limit}"
+        rows = await _db.fetchall(query)
+    return [_row_to_dict(r) for r in rows]
+
+async def _list_disabled_accounts() -> List[Dict[str, Any]]:
+    rows = await _db.fetchall("SELECT * FROM accounts WHERE enabled=0 ORDER BY created_at DESC")
+    return [_row_to_dict(r) for r in rows]
+
+async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """验证账号可用性"""
+    try:
+        account = await refresh_access_token_in_db(account['id'])
+        test_request = {
+            "conversationState": {
+                "currentMessage": {"userInputMessage": {"content": "hello"}},
+                "chatTriggerType": "MANUAL"
+            }
+        }
+        _, _, tracker, event_gen = await send_chat_request(
+            access_token=account['accessToken'],
+            messages=[],
+            stream=True,
+            raw_payload=test_request
+        )
+        if event_gen:
+            async for _ in event_gen:
+                break
+        return True, None
+    except Exception as e:
+        if "AccessDenied" in str(e) or "403" in str(e):
+            return False, "AccessDenied"
+        return False, None
 
 async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
     """
@@ -356,11 +340,14 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     # Selection: random among enabled accounts
-    async with _conn() as conn:
-        candidates = await _list_enabled_accounts(conn)
-        if not candidates:
-            raise HTTPException(status_code=401, detail="No enabled account available")
-        return random.choice(candidates)
+    if LAZY_ACCOUNT_POOL_ENABLED:
+        candidates = await _list_enabled_accounts(limit=LAZY_ACCOUNT_POOL_SIZE)
+    else:
+        candidates = await _list_enabled_accounts()
+
+    if not candidates:
+        raise HTTPException(status_code=401, detail="No enabled account available")
+    return random.choice(candidates)
 
 # ------------------------------------------------------------------------------
 # Pydantic Schemas
@@ -374,6 +361,9 @@ class AccountCreate(BaseModel):
     accessToken: Optional[str] = None
     other: Optional[Dict[str, Any]] = None
     enabled: Optional[bool] = True
+
+class BatchAccountCreate(BaseModel):
+    accounts: List[AccountCreate]
 
 class AccountUpdate(BaseModel):
     label: Optional[str] = None
@@ -403,121 +393,108 @@ TOKEN_URL = f"{OIDC_BASE}/token"
 def _oidc_headers() -> Dict[str, str]:
     return {
         "content-type": "application/json",
-        "user-agent": "aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0 exec-env/CLI md/appVersion-1.19.7",
-        "x-amz-user-agent": "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 exec-env/CLI m/E md/appVersion-1.19.7 app/AmazonQ-For-CLI",
+        "user-agent": "aws-sdk-rust/1.3.9 os/windows lang/rust/1.87.0",
+        "x-amz-user-agent": "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/windows lang/rust/1.87.0 m/E app/AmazonQ-For-CLI",
         "amz-sdk-request": "attempt=1; max=3",
         "amz-sdk-invocation-id": str(uuid.uuid4()),
     }
 
 async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Account not found")
-            acc = _row_to_dict(row)
+    row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+    acc = _row_to_dict(row)
 
-        if not acc.get("clientId") or not acc.get("clientSecret") or not acc.get("refreshToken"):
-            raise HTTPException(status_code=400, detail="Account missing clientId/clientSecret/refreshToken for refresh")
+    if not acc.get("clientId") or not acc.get("clientSecret") or not acc.get("refreshToken"):
+        raise HTTPException(status_code=400, detail="Account missing clientId/clientSecret/refreshToken for refresh")
 
-        payload = {
-            "grantType": "refresh_token",
-            "clientId": acc["clientId"],
-            "clientSecret": acc["clientSecret"],
-            "refreshToken": acc["refreshToken"],
-        }
+    payload = {
+        "grantType": "refresh_token",
+        "clientId": acc["clientId"],
+        "clientSecret": acc["clientSecret"],
+        "refreshToken": acc["refreshToken"],
+    }
 
-        try:
-            # Use global client if available, else fallback (though global should be ready)
-            client = GLOBAL_CLIENT
-            if not client:
-                # Fallback for safety
-                async with httpx.AsyncClient(timeout=60.0) as temp_client:
-                    r = await temp_client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
-                    r.raise_for_status()
-                    data = r.json()
-            else:
-                r = await client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
+    try:
+        # Use global client if available, else fallback (though global should be ready)
+        client = GLOBAL_CLIENT
+        if not client:
+            # Fallback for safety
+            async with httpx.AsyncClient(timeout=60.0) as temp_client:
+                r = await temp_client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
                 r.raise_for_status()
                 data = r.json()
+        else:
+            r = await client.post(TOKEN_URL, headers=_oidc_headers(), json=payload)
+            r.raise_for_status()
+            data = r.json()
 
-            new_access = data.get("accessToken")
-            new_refresh = data.get("refreshToken", acc.get("refreshToken"))
-            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-            status = "success"
-        except httpx.HTTPError as e:
-            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-            status = "failed"
-            await conn.execute(
-                """
-                UPDATE accounts
-                SET last_refresh_time=?, last_refresh_status=?, updated_at=?
-                WHERE id=?
-                """,
-                (now, status, now, account_id),
-            )
-            await conn.commit()
-            # 记录刷新失败次数
-            await _update_stats(account_id, False)
-            raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
-        except Exception as e:
-            # Ensure last_refresh_time is recorded even on unexpected errors
-            now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-            status = "failed"
-            await conn.execute(
-                """
-                UPDATE accounts
-                SET last_refresh_time=?, last_refresh_status=?, updated_at=?
-                WHERE id=?
-                """,
-                (now, status, now, account_id),
-            )
-            await conn.commit()
-            # 记录刷新失败次数
-            await _update_stats(account_id, False)
-            raise
-
-        await conn.execute(
+        new_access = data.get("accessToken")
+        new_refresh = data.get("refreshToken", acc.get("refreshToken"))
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        status = "success"
+    except httpx.HTTPError as e:
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        status = "failed"
+        await _db.execute(
             """
             UPDATE accounts
-            SET accessToken=?, refreshToken=?, last_refresh_time=?, last_refresh_status=?, updated_at=?
+            SET last_refresh_time=?, last_refresh_status=?, updated_at=?
             WHERE id=?
             """,
-            (new_access, new_refresh, now, status, now, account_id),
+            (now, status, now, account_id),
         )
-        await conn.commit()
+        # 记录刷新失败次数
+        await _update_stats(account_id, False)
+        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
+    except Exception as e:
+        # Ensure last_refresh_time is recorded even on unexpected errors
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        status = "failed"
+        await _db.execute(
+            """
+            UPDATE accounts
+            SET last_refresh_time=?, last_refresh_status=?, updated_at=?
+            WHERE id=?
+            """,
+            (now, status, now, account_id),
+        )
+        # 记录刷新失败次数
+        await _update_stats(account_id, False)
+        raise
 
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
-            row2 = await cursor.fetchone()
-            return _row_to_dict(row2)
+    await _db.execute(
+        """
+        UPDATE accounts
+        SET accessToken=?, refreshToken=?, last_refresh_time=?, last_refresh_status=?, updated_at=?
+        WHERE id=?
+        """,
+        (new_access, new_refresh, now, status, now, account_id),
+    )
+
+    row2 = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+    return _row_to_dict(row2)
 
 async def get_account(account_id: str) -> Dict[str, Any]:
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
-            row = await cursor.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Account not found")
-            return _row_to_dict(row)
+    row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return _row_to_dict(row)
 
 async def _update_stats(account_id: str, success: bool) -> None:
-    async with _conn() as conn:
-        if success:
-            await conn.execute("UPDATE accounts SET success_count=success_count+1, error_count=0, updated_at=? WHERE id=?",
-                        (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
-        else:
-            async with conn.execute("SELECT error_count FROM accounts WHERE id=?", (account_id,)) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    new_count = (row[0] or 0) + 1
-                    if new_count >= MAX_ERROR_COUNT:
-                        await conn.execute("UPDATE accounts SET error_count=?, enabled=0, updated_at=? WHERE id=?",
-                                   (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
-                    else:
-                        await conn.execute("UPDATE accounts SET error_count=?, updated_at=? WHERE id=?",
-                                   (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
-        await conn.commit()
+    if success:
+        await _db.execute("UPDATE accounts SET success_count=success_count+1, error_count=0, updated_at=? WHERE id=?",
+                    (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
+    else:
+        row = await _db.fetchone("SELECT error_count FROM accounts WHERE id=?", (account_id,))
+        if row:
+            new_count = (row['error_count'] or 0) + 1
+            if new_count >= MAX_ERROR_COUNT:
+                await _db.execute("UPDATE accounts SET error_count=?, enabled=0, updated_at=? WHERE id=?",
+                           (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
+            else:
+                await _db.execute("UPDATE accounts SET error_count=?, updated_at=? WHERE id=?",
+                           (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
 
 # ------------------------------------------------------------------------------
 # Dependencies
@@ -525,10 +502,28 @@ async def _update_stats(account_id: str, success: bool) -> None:
 
 async def require_account(
     authorization: Optional[str] = Header(default=None),
-    x_api_key: Optional[str] = Header(default=None, alias="x-api-key")
+    x_api_key: Optional[str] = Header(default=None)
 ) -> Dict[str, Any]:
-    bearer = _extract_bearer(authorization) or x_api_key
-    return await resolve_account_for_key(bearer)
+    key = _extract_bearer(authorization) if authorization else x_api_key
+    return await resolve_account_for_key(key)
+
+def verify_admin_password(authorization: Optional[str] = Header(None)) -> bool:
+    """Verify admin password for console access"""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Unauthorized access", "code": "UNAUTHORIZED"}
+        )
+
+    password = authorization[7:]  # Remove "Bearer " prefix
+
+    if password != ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": "Invalid password", "code": "INVALID_PASSWORD"}
+        )
+
+    return True
 
 # ------------------------------------------------------------------------------
 # OpenAI-compatible Chat endpoint
@@ -566,59 +561,75 @@ def _openai_non_streaming_response(
 def _sse_format(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-@app.post("/v1/messages/count_tokens")
-async def count_tokens_endpoint(req: ClaudeRequest):
-    """
-    Claude token counting endpoint - 使用 tiktoken 精确计数
-    """
-    text_to_count = ""
-
-    if req.system:
-        if isinstance(req.system, str):
-            text_to_count += req.system
-        elif isinstance(req.system, list):
-            for b in req.system:
-                if isinstance(b, dict) and b.get("type") == "text":
-                    text_to_count += b.get("text", "")
-
-    for msg in req.messages:
-        content = msg.content
-        if isinstance(content, str):
-            text_to_count += content
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_to_count += block.get("text", "")
-
-    tokens = count_tokens(text_to_count)
-
-    return {"input_tokens": tokens}
-
 @app.post("/v1/messages")
 async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(require_account)):
     """
     Claude-compatible messages endpoint.
     """
-    # Check if Claude modules are available
-    if not callable(convert_claude_to_amazonq_request) or not ClaudeStreamHandler:
-        raise HTTPException(status_code=503, detail="Claude modules not available")
-
     # 1. Convert request
     try:
         aq_request = convert_claude_to_amazonq_request(req)
     except Exception as e:
-        logging.error(f"Request conversion failed: {e}", exc_info=True)
+        traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
-    # 2. Send upstream - always stream to get full event details
+    # 2. Send upstream
+    async def _send_upstream_raw() -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any, Optional[AsyncGenerator[Any, None]]]:
+        access = account.get("accessToken")
+        if not access:
+            refreshed = await refresh_access_token_in_db(account["id"])
+            access = refreshed.get("accessToken")
+            if not access:
+                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
+        
+        # We use the modified send_chat_request which accepts raw_payload
+        # and returns (text, text_stream, tracker, event_stream)
+        return await send_chat_request(
+            access_token=access,
+            messages=[], # Not used when raw_payload is present
+            model=req.model,
+            stream=req.stream,
+            client=GLOBAL_CLIENT,
+            raw_payload=aq_request
+        )
+
+    try:
+        _, _, tracker, event_stream = await _send_upstream_raw()
+        
+        if not req.stream:
+            # Non-streaming: we need to consume the stream and build response
+            # But wait, send_chat_request with stream=False returns text, but we need structured response
+            # Actually, for Claude format, we might want to parse the events even for non-streaming
+            # to get tool calls etc correctly.
+            # However, our modified send_chat_request returns event_stream if raw_payload is used AND stream=True?
+            # Let's check replicate.py modification.
+            # If stream=False, it returns text. But text might not be enough for tool calls.
+            # For simplicity, let's force stream=True internally and aggregate if req.stream is False.
+            pass
+    except Exception as e:
+        await _update_stats(account["id"], False)
+        raise
+
+    # We always use streaming upstream to handle events properly
+    try:
+        # Force stream=True for upstream to get events
+        # But wait, send_chat_request logic: if stream=True, returns event_stream
+        # We need to call it with stream=True
+        pass
+    except:
+        pass
+        
+    # Re-implementing logic to be cleaner
+    
+    # Always stream from upstream to get full event details
     event_iter = None
+    first_event_received = False
     try:
         access = account.get("accessToken")
         if not access:
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
-
+        
         # We call with stream=True to get the event iterator
         _, _, tracker, event_iter = await send_chat_request(
             access_token=access,
@@ -628,7 +639,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             client=GLOBAL_CLIENT,
             raw_payload=aq_request
         )
-
+        
         if not event_iter:
              raise HTTPException(status_code=502, detail="No event stream returned")
 
@@ -642,7 +653,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 for item in req.system:
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_to_count += item.get("text", "")
-
+        
         for msg in req.messages:
             if isinstance(msg.content, str):
                 text_to_count += msg.content
@@ -651,7 +662,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     if isinstance(item, dict) and item.get("type") == "text":
                         text_to_count += item.get("text", "")
 
-        input_tokens = count_tokens(text_to_count)
+        input_tokens = count_tokens(text_to_count, apply_multiplier=True)
         handler = ClaudeStreamHandler(model=req.model, input_tokens=input_tokens)
 
         # Try to get the first event to ensure the connection is valid
@@ -659,20 +670,12 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         first_event = None
         try:
             first_event = await event_iter.__anext__()
+            first_event_received = True
         except StopAsyncIteration:
             raise HTTPException(status_code=502, detail="Empty response from upstream")
-        except httpx.HTTPError as e:
-            # Parse upstream error and return appropriate status code
-            error_msg = str(e)
-            if "500" in error_msg or "InternalServerException" in error_msg:
-                raise HTTPException(status_code=502, detail=f"Upstream server error: {error_msg}")
-            elif "400" in error_msg or "401" in error_msg or "403" in error_msg:
-                raise HTTPException(status_code=502, detail=f"Upstream authentication error: {error_msg}")
-            else:
-                raise HTTPException(status_code=502, detail=f"Upstream error: {error_msg}")
         except Exception as e:
-            # Other unexpected errors
-            raise HTTPException(status_code=502, detail=f"Unexpected error: {str(e)}")
+            # If we get an error before the first event, we can still return proper status code
+            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
 
         async def event_generator():
             try:
@@ -681,7 +684,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     event_type, payload = first_event
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
-
+                
                 # Process remaining events
                 async for event_type, payload in event_iter:
                     async for sse in handler.handle_event(event_type, payload):
@@ -705,7 +708,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             # But to be nice, let's try to support non-streaming by consuming the generator
             
             content_blocks = []
-            usage = {"input_tokens": input_tokens, "output_tokens": 0}
+            usage = {"input_tokens": 0, "output_tokens": 0}
             stop_reason = None
             
             # We need to parse the SSE strings back to objects... inefficient but works
@@ -715,66 +718,65 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             
             # Let's implement a basic accumulator from the SSE stream
             final_content = []
-
+            
             async for sse_chunk in event_generator():
-                # Each chunk can have multiple lines ('event:', 'data:').
-                # Process ALL 'data:' lines, not just the first one.
+                data_str = None
+                # Each chunk from the generator can have multiple lines ('event:', 'data:').
+                # We need to find the 'data:' line.
                 for line in sse_chunk.strip().split('\n'):
-                    if not line.startswith("data:"):
-                        continue
-
-                    data_str = line[6:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        continue
-
-                    try:
-                        data = json.loads(data_str)
-                        dtype = data.get("type")
-
-                        if dtype == "content_block_start":
-                            idx = data.get("index", 0)
-                            while len(final_content) <= idx:
-                                final_content.append(None)
-                            final_content[idx] = data.get("content_block")
-
-                        elif dtype == "content_block_delta":
-                            idx = data.get("index", 0)
-                            delta = data.get("delta", {})
-                            if final_content[idx]:
-                                if delta.get("type") == "text_delta":
-                                    final_content[idx]["text"] += delta.get("text", "")
-                                elif delta.get("type") == "input_json_delta":
-                                    if "partial_json" not in final_content[idx]:
-                                        final_content[idx]["partial_json"] = ""
-                                    final_content[idx]["partial_json"] += delta.get("partial_json", "")
-
-                        elif dtype == "content_block_stop":
-                            idx = data.get("index", 0)
-                            if final_content[idx] and final_content[idx].get("type") == "tool_use":
-                                if "partial_json" in final_content[idx]:
-                                    try:
-                                        final_content[idx]["input"] = json.loads(final_content[idx]["partial_json"])
-                                    except json.JSONDecodeError:
-                                        # Keep partial if invalid
-                                        final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
-                                    del final_content[idx]["partial_json"]
-
-                        elif dtype == "message_delta":
-                            # Merge usage counters instead of replacing
-                            delta_usage = data.get("usage", {})
-                            if delta_usage:
-                                usage.update(delta_usage)
-                                # Recalculate total_tokens
-                                usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                            stop_reason = data.get("delta", {}).get("stop_reason")
-
-                    except json.JSONDecodeError:
-                        # Ignore lines that are not valid JSON
-                        pass
-                    except Exception as e:
-                        # Log unexpected errors but don't crash
-                        logger.warning(f"Error processing SSE event: {e}")
-                        pass
+                    if line.startswith("data:"):
+                        data_str = line[6:].strip()
+                        break
+                
+                if not data_str or data_str == "[DONE]":
+                    continue
+                
+                try:
+                    data = json.loads(data_str)
+                    dtype = data.get("type")
+                    
+                    if dtype == "content_block_start":
+                        idx = data.get("index", 0)
+                        while len(final_content) <= idx:
+                            final_content.append(None)
+                        final_content[idx] = data.get("content_block")
+                    
+                    elif dtype == "content_block_delta":
+                        idx = data.get("index", 0)
+                        delta = data.get("delta", {})
+                        if final_content[idx]:
+                            if delta.get("type") == "text_delta":
+                                final_content[idx]["text"] += delta.get("text", "")
+                            elif delta.get("type") == "thinking_delta":
+                                final_content[idx].setdefault("thinking", "")
+                                final_content[idx]["thinking"] += delta.get("thinking", "")
+                            elif delta.get("type") == "input_json_delta":
+                                if "partial_json" not in final_content[idx]:
+                                    final_content[idx]["partial_json"] = ""
+                                final_content[idx]["partial_json"] += delta.get("partial_json", "")
+                    
+                    elif dtype == "content_block_stop":
+                        idx = data.get("index", 0)
+                        if final_content[idx] and final_content[idx].get("type") == "tool_use":
+                            if "partial_json" in final_content[idx]:
+                                try:
+                                    final_content[idx]["input"] = json.loads(final_content[idx]["partial_json"])
+                                except json.JSONDecodeError:
+                                    # Keep partial if invalid
+                                    final_content[idx]["input"] = {"error": "invalid json", "partial": final_content[idx]["partial_json"]}
+                                del final_content[idx]["partial_json"]
+                    
+                    elif dtype == "message_delta":
+                        usage = data.get("usage", usage)
+                        stop_reason = data.get("delta", {}).get("stop_reason")
+                
+                except json.JSONDecodeError:
+                    # Ignore lines that are not valid JSON
+                    pass
+                except Exception:
+                    # Broad exception to prevent accumulator from crashing on one bad event
+                    traceback.print_exc()
+                    pass
 
             # Final assembly
             final_content_cleaned = []
@@ -784,11 +786,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     c.pop("partial_json", None)
                     final_content_cleaned.append(c)
 
-            # Ensure total_tokens is always present
-            if "total_tokens" not in usage:
-                usage["total_tokens"] = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-
-            return {
+            return JSONResponse(content={
                 "id": f"msg_{uuid.uuid4()}",
                 "type": "message",
                 "role": "assistant",
@@ -797,7 +795,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
                 "usage": usage
-            }
+            })
 
     except Exception as e:
         # Ensure event_iter (if created) is closed to release upstream connection
@@ -808,6 +806,41 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             pass
         await _update_stats(account["id"], False)
         raise
+
+@app.post("/v1/messages/count_tokens")
+async def count_tokens_endpoint(req: ClaudeRequest):
+    """
+    Count tokens in a message without sending it.
+    Compatible with Claude API's /v1/messages/count_tokens endpoint.
+    Uses tiktoken for local token counting.
+    """
+    text_to_count = ""
+    
+    # Count system prompt tokens
+    if req.system:
+        if isinstance(req.system, str):
+            text_to_count += req.system
+        elif isinstance(req.system, list):
+            for item in req.system:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+    
+    # Count message tokens
+    for msg in req.messages:
+        if isinstance(msg.content, str):
+            text_to_count += msg.content
+        elif isinstance(msg.content, list):
+            for item in msg.content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+    
+    # Count tool definition tokens if present
+    if req.tools:
+        text_to_count += json.dumps([tool.model_dump() if hasattr(tool, 'model_dump') else tool for tool in req.tools], ensure_ascii=False)
+    
+    input_tokens = count_tokens(text_to_count, apply_multiplier=True)
+    
+    return {"input_tokens": input_tokens}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depends(require_account)):
@@ -841,9 +874,9 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
 
             text, _, tracker = await _send_upstream(stream=False)
             await _update_stats(account["id"], bool(text))
-
+            
             completion_tokens = count_tokens(text or "")
-
+            
             return JSONResponse(content=_openai_non_streaming_response(
                 text or "",
                 model,
@@ -866,7 +899,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
 
             _, it, tracker = await _send_upstream(stream=True)
             assert it is not None
-
+            
             async def event_gen() -> AsyncGenerator[str, None]:
                 completion_text = ""
                 try:
@@ -878,7 +911,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                         "model": model_used,
                         "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
                     })
-
+                    
                     # Stream content
                     async for piece in it:
                         if piece:
@@ -890,7 +923,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                                 "model": model_used,
                                 "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
                             })
-
+                    
                     # Send stop and usage
                     completion_tokens = count_tokens(completion_text)
                     yield _sse_format({
@@ -905,6 +938,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                             "total_tokens": prompt_tokens + completion_tokens,
                         }
                     })
+                    
                     yield "data: [DONE]\n\n"
                     await _update_stats(account["id"], True)
                 except GeneratorExit:
@@ -950,6 +984,13 @@ class AuthStartBody(BaseModel):
     label: Optional[str] = None
     enabled: Optional[bool] = True
 
+class AdminLoginRequest(BaseModel):
+    password: str
+
+class AdminLoginResponse(BaseModel):
+    success: bool
+    message: str
+
 async def _create_account_from_tokens(
     client_id: str,
     client_secret: str,
@@ -960,37 +1001,63 @@ async def _create_account_from_tokens(
 ) -> Dict[str, Any]:
     now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
     acc_id = str(uuid.uuid4())
-    async with _conn() as conn:
-        conn.row_factory = aiosqlite.Row
-        await conn.execute(
-            """
-            INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                acc_id,
-                label,
-                client_id,
-                client_secret,
-                refresh_token,
-                access_token,
-                None,
-                now,
-                "success",
-                now,
-                now,
-                1 if enabled else 0,
-            ),
-        )
-        await conn.commit()
-        async with conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)) as cursor:
-            row = await cursor.fetchone()
-            return _row_to_dict(row)
+    await _db.execute(
+        """
+        INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            acc_id,
+            label,
+            client_id,
+            client_secret,
+            refresh_token,
+            access_token,
+            None,
+            now,
+            "success",
+            now,
+            now,
+            1 if enabled else 0,
+        ),
+    )
+    row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
+    return _row_to_dict(row)
 
 # 管理控制台相关端点 - 仅在启用时注册
 if CONSOLE_ENABLED:
+    # ------------------------------------------------------------------------------
+    # Admin Authentication Endpoints
+    # ------------------------------------------------------------------------------
+
+    @app.post("/api/login", response_model=AdminLoginResponse)
+    async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
+        """Admin login endpoint - password only"""
+        if request.password == ADMIN_PASSWORD:
+            return AdminLoginResponse(
+                success=True,
+                message="Login successful"
+            )
+        else:
+            return AdminLoginResponse(
+                success=False,
+                message="Invalid password"
+            )
+
+    @app.get("/login", response_class=FileResponse)
+    def login_page():
+        """Serve the login page"""
+        path = BASE_DIR / "frontend" / "login.html"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="frontend/login.html not found")
+        return FileResponse(str(path))
+
+    # ------------------------------------------------------------------------------
+    # Device Authorization Endpoints
+    # ------------------------------------------------------------------------------
+
     @app.post("/v2/auth/start")
-    async def auth_start(body: AuthStartBody):
+    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_password)):
         """
         Start device authorization and return verification URL for user login.
         Session lifetime capped at 5 minutes on claim.
@@ -999,11 +1066,7 @@ if CONSOLE_ENABLED:
             cid, csec = await register_client_min()
             dev = await device_authorize(cid, csec)
         except httpx.HTTPError as e:
-            logging.error(f"OIDC HTTP error in auth_start: {e}", exc_info=True)
-            raise HTTPException(status_code=502, detail="OIDC error")
-        except Exception as e:
-            logging.error(f"Unexpected error in auth_start: {e}", exc_info=True)
-            raise HTTPException(status_code=502, detail="Auth start failed")
+            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
 
         auth_id = str(uuid.uuid4())
         sess = {
@@ -1031,7 +1094,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str, _auth = Depends(require_console_auth)):
+    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_password)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
@@ -1046,7 +1109,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str, _auth = Depends(require_console_auth)):
+    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_password)):
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1101,40 +1164,102 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate, _auth = Depends(require_console_auth)):
+    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_password)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
         enabled_val = 1 if (body.enabled is None or body.enabled) else 0
-        async with _conn() as conn:
-            conn.row_factory = aiosqlite.Row
-            await conn.execute(
+        await _db.execute(
+            """
+            INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                acc_id,
+                body.label,
+                body.clientId,
+                body.clientSecret,
+                body.refreshToken,
+                body.accessToken,
+                other_str,
+                None,
+                "never",
+                now,
+                now,
+                enabled_val,
+            ),
+        )
+        row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (acc_id,))
+        return _row_to_dict(row)
+
+
+    async def _verify_and_enable_accounts(account_ids: List[str]):
+        """后台异步验证并启用账号"""
+        for acc_id in account_ids:
+            try:
+                # 必须先获取完整的账号信息
+                account = await get_account(acc_id)
+                verify_success, fail_reason = await verify_account(account)
+                now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+                if verify_success:
+                    await _db.execute("UPDATE accounts SET enabled=1, updated_at=? WHERE id=?", (now, acc_id))
+                elif fail_reason:
+                    other_dict = account.get("other", {}) or {}
+                    other_dict['failedReason'] = fail_reason
+                    await _db.execute("UPDATE accounts SET other=?, updated_at=? WHERE id=?", (json.dumps(other_dict, ensure_ascii=False), now, acc_id))
+            except Exception as e:
+                print(f"Error verifying account {acc_id}: {e}")
+                traceback.print_exc()
+
+    @app.post("/v2/accounts/feed")
+    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_password)):
+        """
+        统一的投喂接口，接收账号列表，立即存入并后台异步验证。
+        """
+        now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        new_account_ids = []
+
+        for i, account_data in enumerate(request.accounts):
+            acc_id = str(uuid.uuid4())
+            other_dict = account_data.other or {}
+            other_dict['source'] = 'feed'
+            other_str = json.dumps(other_dict, ensure_ascii=False)
+
+            await _db.execute(
                 """
                 INSERT INTO accounts (id, label, clientId, clientSecret, refreshToken, accessToken, other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     acc_id,
-                    body.label,
-                    body.clientId,
-                    body.clientSecret,
-                    body.refreshToken,
-                    body.accessToken,
+                    account_data.label or f"批量账号 {i+1}",
+                    account_data.clientId,
+                    account_data.clientSecret,
+                    account_data.refreshToken,
+                    account_data.accessToken,
                     other_str,
                     None,
                     "never",
                     now,
                     now,
-                    enabled_val,
+                    0,  # 初始为禁用状态
                 ),
             )
-            await conn.commit()
-            async with conn.execute("SELECT * FROM accounts WHERE id=?", (acc_id,)) as cursor:
-                row = await cursor.fetchone()
-                return _row_to_dict(row)
+            new_account_ids.append(acc_id)
+
+        # 启动后台任务进行验证，不阻塞当前请求
+        if new_account_ids:
+            asyncio.create_task(_verify_and_enable_accounts(new_account_ids))
+
+        return {
+            "status": "processing",
+            "message": f"{len(new_account_ids)} accounts received and are being verified in the background.",
+            "account_ids": new_account_ids
+        }
 
     @app.get("/v2/accounts")
-    async def list_accounts(_auth = Depends(require_console_auth), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
+    async def list_accounts(_: bool = Depends(verify_admin_password), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
         query = "SELECT * FROM accounts"
         params = []
         if enabled is not None:
@@ -1143,28 +1268,23 @@ if CONSOLE_ENABLED:
         sort_field = "created_at" if sort_by not in ["created_at", "success_count"] else sort_by
         order = "DESC" if sort_order.lower() == "desc" else "ASC"
         query += f" ORDER BY {sort_field} {order}"
-        async with _conn() as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute(query, tuple(params) if params else ()) as cursor:
-                rows = await cursor.fetchall()
-                accounts = [_row_to_dict(r) for r in rows]
-                return {"accounts": accounts, "count": len(accounts)}
+        rows = await _db.fetchall(query, tuple(params) if params else ())
+        accounts = [_row_to_dict(r) for r in rows]
+        return {"accounts": accounts, "count": len(accounts)}
 
     @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str, _auth = Depends(require_console_auth)):
+    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
         return await get_account(account_id)
 
     @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str, _auth = Depends(require_console_auth)):
-        async with _conn() as conn:
-            cur = await conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
-            await conn.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Account not found")
-            return {"deleted": account_id}
+    async def delete_account(account_id: str, _: bool = Depends(verify_admin_password)):
+        rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+        if rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate, _auth = Depends(require_console_auth)):
+    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_password)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1190,18 +1310,14 @@ if CONSOLE_ENABLED:
         fields.append("updated_at=?"); values.append(now)
         values.append(account_id)
 
-        async with _conn() as conn:
-            conn.row_factory = aiosqlite.Row
-            cur = await conn.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id=?", values)
-            await conn.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Account not found")
-            async with conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)) as cursor:
-                row = await cursor.fetchone()
-                return _row_to_dict(row)
+        rowcount = await _db.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id=?", tuple(values))
+        if rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+        row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+        return _row_to_dict(row)
 
     @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str, _auth = Depends(require_console_auth)):
+    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)):
         return await refresh_access_token_in_db(account_id)
 
     # ------------------------------------------------------------------------------
@@ -1209,10 +1325,12 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     # Frontend inline HTML removed; serving ./frontend/index.html instead (see route below)
+    # Note: This route is NOT protected - the HTML file is served freely,
+    # but the frontend JavaScript checks authentication and redirects to /login if needed.
+    # All API endpoints remain protected.
 
     @app.get("/", response_class=FileResponse)
     def index():
-        """前端页面不鉴权，由前端 JS 检查 token 并调用 API"""
         path = BASE_DIR / "frontend" / "index.html"
         if not path.exists():
             raise HTTPException(status_code=404, detail="frontend/index.html not found")
@@ -1230,13 +1348,52 @@ async def health():
 # Startup / Shutdown Events
 # ------------------------------------------------------------------------------
 
+# async def _verify_disabled_accounts_loop():
+#     """后台验证禁用账号任务"""
+#     while True:
+#         try:
+#             await asyncio.sleep(1800)
+#             async with _conn() as conn:
+#                 accounts = await _list_disabled_accounts(conn)
+#                 if accounts:
+#                     for account in accounts:
+#                         other = account.get('other')
+#                         if other:
+#                             try:
+#                                 other_dict = json.loads(other) if isinstance(other, str) else other
+#                                 if other_dict.get('failedReason') == 'AccessDenied':
+#                                     continue
+#                             except:
+#                                 pass
+#                         try:
+#                             verify_success, fail_reason = await verify_account(account)
+#                             now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+#                             if verify_success:
+#                                 await conn.execute("UPDATE accounts SET enabled=1, updated_at=? WHERE id=?", (now, account['id']))
+#                             elif fail_reason:
+#                                 other_dict = {}
+#                                 if account.get('other'):
+#                                     try:
+#                                         other_dict = json.loads(account['other']) if isinstance(account['other'], str) else account['other']
+#                                     except:
+#                                         pass
+#                                 other_dict['failedReason'] = fail_reason
+#                                 await conn.execute("UPDATE accounts SET other=?, updated_at=? WHERE id=?", (json.dumps(other_dict, ensure_ascii=False), now, account['id']))
+#                             await conn.commit()
+#                         except Exception:
+#                             pass
+#         except Exception:
+#             pass
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and start background tasks on startup."""
     await _init_global_client()
     await _ensure_db()
     asyncio.create_task(_refresh_stale_tokens())
+    # asyncio.create_task(_verify_disabled_accounts_loop())
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await _close_global_client()
+    await close_db()

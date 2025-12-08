@@ -21,6 +21,45 @@ else:
 
 logger = logging.getLogger(__name__)
 
+THINKING_HINT = "<antml:thinking_mode>interleaved</antml:thinking_mode><antml:max_thinking_length>16000</antml:max_thinking_length>"
+THINKING_START_TAG = "<thinking>"
+THINKING_END_TAG = "</thinking>"
+
+def _wrap_thinking_content(thinking_text: str) -> str:
+    """Wrap thinking text with the XML tag expected by Amazon Q."""
+    return f"{THINKING_START_TAG}{thinking_text}{THINKING_END_TAG}"
+
+def is_thinking_mode_enabled(thinking_cfg: Optional[Any]) -> bool:
+    """Detect whether the client enabled thinking mode."""
+    if thinking_cfg is None:
+        return False
+    if isinstance(thinking_cfg, bool):
+        return thinking_cfg
+    if isinstance(thinking_cfg, str):
+        return thinking_cfg.lower() == "enabled"
+    if isinstance(thinking_cfg, dict):
+        type_val = str(thinking_cfg.get("type", "")).lower()
+        if type_val == "enabled":
+            return True
+        enabled_flag = thinking_cfg.get("enabled")
+        if isinstance(enabled_flag, bool):
+            return enabled_flag
+        budget = thinking_cfg.get("budget_tokens")
+        if isinstance(budget, (int, float)) and budget > 0:
+            return True
+    return False
+
+def _append_thinking_hint(text: str, hint: str = THINKING_HINT) -> str:
+    """Append the special hint once to the end of the text."""
+    text = text or ""
+    normalized = text.rstrip()
+    if normalized.endswith(hint):
+        return text
+    if not text:
+        return hint
+    separator = "" if text.endswith(("\n", "\r")) else "\n"
+    return f"{text}{separator}{hint}"
+
 def get_current_timestamp() -> str:
     """Get current timestamp in Amazon Q format."""
     now = datetime.now().astimezone()
@@ -43,8 +82,11 @@ def extract_text_from_content(content: Union[str, List[Dict[str, Any]]]) -> str:
         parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                block_type = block.get("type")
+                if block_type == "text":
                     parts.append(block.get("text", ""))
+                elif block_type == "thinking":
+                    parts.append(_wrap_thinking_content(block.get("thinking", "")))
         return "\n".join(parts)
     return ""
 
@@ -127,7 +169,7 @@ def merge_user_messages(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     
     return result
 
-def process_history(messages: List[ClaudeMessage]) -> List[Dict[str, Any]]:
+def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = False, hint: str = THINKING_HINT) -> List[Dict[str, Any]]:
     """Process history messages to match Amazon Q format (alternating user/assistant)."""
     history = []
     seen_tool_use_ids = set()
@@ -141,6 +183,7 @@ def process_history(messages: List[ClaudeMessage]) -> List[Dict[str, Any]]:
             text_content = ""
             tool_results = None
             images = extract_images_from_content(content)
+            should_append_hint = thinking_enabled
             
             if isinstance(content, list):
                 text_parts = []
@@ -149,6 +192,8 @@ def process_history(messages: List[ClaudeMessage]) -> List[Dict[str, Any]]:
                         btype = block.get("type")
                         if btype == "text":
                             text_parts.append(block.get("text", ""))
+                        elif btype == "thinking":
+                            text_parts.append(_wrap_thinking_content(block.get("thinking", "")))
                         elif btype == "tool_result":
                             if tool_results is None:
                                 tool_results = []
@@ -185,6 +230,9 @@ def process_history(messages: List[ClaudeMessage]) -> List[Dict[str, Any]]:
                 text_content = "\n".join(text_parts)
             else:
                 text_content = extract_text_from_content(content)
+            
+            if should_append_hint:
+                text_content = _append_thinking_hint(text_content, hint)
             
             user_ctx = {
                 "envState": {
@@ -255,6 +303,8 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     """Convert ClaudeRequest to Amazon Q request body."""
     if conversation_id is None:
         conversation_id = str(uuid.uuid4())
+    
+    thinking_enabled = is_thinking_mode_enabled(getattr(req, "thinking", None))
         
     # 1. Tools
     aq_tools = []
@@ -283,6 +333,8 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
                     btype = block.get("type")
                     if btype == "text":
                         text_parts.append(block.get("text", ""))
+                    elif btype == "thinking":
+                        text_parts.append(_wrap_thinking_content(block.get("thinking", "")))
                     elif btype == "tool_result":
                         has_tool_result = True
                         if tool_results is None:
@@ -319,6 +371,9 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             prompt_content = "\n".join(text_parts)
         else:
             prompt_content = extract_text_from_content(content)
+
+        if thinking_enabled:
+            prompt_content = _append_thinking_hint(prompt_content)
             
     # 3. Context
     user_ctx = {
@@ -391,7 +446,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         
     # 7. History
     history_msgs = req.messages[:-1] if len(req.messages) > 1 else []
-    aq_history = process_history(history_msgs)
+    aq_history = process_history(history_msgs, thinking_enabled=thinking_enabled, hint=THINKING_HINT)
     
     # 8. Final Body
     return {

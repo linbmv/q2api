@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git fetch upstream2)",
+      "Bash(git cherry-pick 36f74ee)",
+      "Bash(git cherry-pick --abort)",
+      "Bash(git cherry-pick 3bb8930)",
+      "Bash(git fetch:*)",
+      "Bash(git log upstream/main --oneline --grep=\"thinking\\|stream\\|token\\|sqlite\\|performance\" -i)",
+      "Bash(git branch:*)",
+      "Bash(git merge:*)",
+      "Bash(git add:*)",
+      "Bash(git checkout:*)",
+      "Bash(git commit:*)",
+      "Bash(git reset:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(cat:*)",
+      "Bash(git log:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
