@@ -204,14 +204,9 @@ async def _refresh_stale_tokens():
                 print("[Error] Database not initialized, skipping token refresh cycle.")
                 continue
             now = time.time()
-            
-            if LAZY_ACCOUNT_POOL_ENABLED:
-                limit = LAZY_ACCOUNT_POOL_SIZE + LAZY_ACCOUNT_POOL_REFRESH_OFFSET
-                order_direction = "DESC" if LAZY_ACCOUNT_POOL_ORDER_DESC else "ASC"
-                query = f"SELECT id, last_refresh_time FROM accounts WHERE enabled=1 ORDER BY {LAZY_ACCOUNT_POOL_ORDER_BY} {order_direction} LIMIT {limit}"
-                rows = await _db.fetchall(query)
-            else:
-                rows = await _db.fetchall("SELECT id, last_refresh_time FROM accounts WHERE enabled=1")
+
+            query = "SELECT id, last_refresh_time FROM accounts WHERE enabled=1"
+            rows = await _db.fetchall(query)
 
             for row in rows:
                 acc_id, last_refresh = row['id'], row['last_refresh_time']
@@ -258,17 +253,6 @@ ALLOWED_API_KEYS: List[str] = _parse_allowed_keys_env()
 MAX_ERROR_COUNT: int = int(os.getenv("MAX_ERROR_COUNT", "100"))
 TOKEN_COUNT_MULTIPLIER: float = float(os.getenv("TOKEN_COUNT_MULTIPLIER", "1.0"))
 
-# Lazy Account Pool settings
-LAZY_ACCOUNT_POOL_ENABLED: bool = os.getenv("LAZY_ACCOUNT_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
-LAZY_ACCOUNT_POOL_SIZE: int = int(os.getenv("LAZY_ACCOUNT_POOL_SIZE", "20"))
-LAZY_ACCOUNT_POOL_REFRESH_OFFSET: int = int(os.getenv("LAZY_ACCOUNT_POOL_REFRESH_OFFSET", "10"))
-LAZY_ACCOUNT_POOL_ORDER_BY: str = os.getenv("LAZY_ACCOUNT_POOL_ORDER_BY", "created_at")
-LAZY_ACCOUNT_POOL_ORDER_DESC: bool = os.getenv("LAZY_ACCOUNT_POOL_ORDER_DESC", "false").lower() in ("true", "1", "yes")
-
-# Validate LAZY_ACCOUNT_POOL_ORDER_BY to prevent SQL injection
-if LAZY_ACCOUNT_POOL_ORDER_BY not in ["created_at", "id", "success_count"]:
-    LAZY_ACCOUNT_POOL_ORDER_BY = "created_at"
-
 def _is_console_enabled() -> bool:
     """检查是否启用管理控制台"""
     console_env = os.getenv("ENABLE_CONSOLE", "true").strip().lower()
@@ -276,8 +260,8 @@ def _is_console_enabled() -> bool:
 
 CONSOLE_ENABLED: bool = _is_console_enabled()
 
-# Admin authentication configuration
-ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin")
+# Console authentication configuration
+CONSOLE_TOKEN: str = os.getenv("CONSOLE_TOKEN", "").strip()
 
 def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     if not token_header:
@@ -287,17 +271,10 @@ def _extract_bearer(token_header: Optional[str]) -> Optional[str]:
     return token_header.strip()
 
 async def _list_enabled_accounts(limit: Optional[int] = None) -> List[Dict[str, Any]]:
-    if LAZY_ACCOUNT_POOL_ENABLED:
-        order_direction = "DESC" if LAZY_ACCOUNT_POOL_ORDER_DESC else "ASC"
-        query = f"SELECT * FROM accounts WHERE enabled=1 ORDER BY {LAZY_ACCOUNT_POOL_ORDER_BY} {order_direction}"
-        if limit:
-            query += f" LIMIT {limit}"
-        rows = await _db.fetchall(query)
-    else:
-        query = "SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC"
-        if limit:
-            query += f" LIMIT {limit}"
-        rows = await _db.fetchall(query)
+    query = "SELECT * FROM accounts WHERE enabled=1 ORDER BY created_at DESC"
+    if limit:
+        query += f" LIMIT {limit}"
+    rows = await _db.fetchall(query)
     return [_row_to_dict(r) for r in rows]
 
 async def _list_disabled_accounts() -> List[Dict[str, Any]]:
@@ -340,10 +317,7 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     # Selection: random among enabled accounts
-    if LAZY_ACCOUNT_POOL_ENABLED:
-        candidates = await _list_enabled_accounts(limit=LAZY_ACCOUNT_POOL_SIZE)
-    else:
-        candidates = await _list_enabled_accounts()
+    candidates = await _list_enabled_accounts()
 
     if not candidates:
         raise HTTPException(status_code=401, detail="No enabled account available")
@@ -507,22 +481,14 @@ async def require_account(
     key = _extract_bearer(authorization) if authorization else x_api_key
     return await resolve_account_for_key(key)
 
-def verify_admin_password(authorization: Optional[str] = Header(None)) -> bool:
-    """Verify admin password for console access"""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=401,
-            detail={"error": "Unauthorized access", "code": "UNAUTHORIZED"}
-        )
+async def verify_console_token(authorization: Optional[str] = Header(None)) -> bool:
+    """验证控制台访问令牌"""
+    if not CONSOLE_TOKEN:
+        return True
 
-    password = authorization[7:]  # Remove "Bearer " prefix
-
-    if password != ADMIN_PASSWORD:
-        raise HTTPException(
-            status_code=401,
-            detail={"error": "Invalid password", "code": "INVALID_PASSWORD"}
-        )
-
+    bearer = _extract_bearer(authorization)
+    if not bearer or bearer != CONSOLE_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid console token")
     return True
 
 # ------------------------------------------------------------------------------
@@ -1033,7 +999,7 @@ if CONSOLE_ENABLED:
     @app.post("/api/login", response_model=AdminLoginResponse)
     async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
         """Admin login endpoint - password only"""
-        if request.password == ADMIN_PASSWORD:
+        if not CONSOLE_TOKEN or request.password == CONSOLE_TOKEN:
             return AdminLoginResponse(
                 success=True,
                 message="Login successful"
@@ -1044,20 +1010,12 @@ if CONSOLE_ENABLED:
                 message="Invalid password"
             )
 
-    @app.get("/login", response_class=FileResponse)
-    def login_page():
-        """Serve the login page"""
-        path = BASE_DIR / "frontend" / "login.html"
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="frontend/login.html not found")
-        return FileResponse(str(path))
-
     # ------------------------------------------------------------------------------
     # Device Authorization Endpoints
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/auth/start")
-    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_admin_password)):
+    async def auth_start(body: AuthStartBody, _: bool = Depends(verify_console_token)):
         """
         Start device authorization and return verification URL for user login.
         Session lifetime capped at 5 minutes on claim.
@@ -1094,7 +1052,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/auth/status/{auth_id}")
-    async def auth_status(auth_id: str, _: bool = Depends(verify_admin_password)):
+    async def auth_status(auth_id: str, _: bool = Depends(verify_console_token)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
             raise HTTPException(status_code=404, detail="Auth session not found")
@@ -1109,7 +1067,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.post("/v2/auth/claim/{auth_id}")
-    async def auth_claim(auth_id: str, _: bool = Depends(verify_admin_password)):
+    async def auth_claim(auth_id: str, _: bool = Depends(verify_console_token)):
         """
         Block up to 5 minutes to exchange the device code for tokens after user completed login.
         On success, creates an enabled account and returns it.
@@ -1164,7 +1122,7 @@ if CONSOLE_ENABLED:
     # ------------------------------------------------------------------------------
 
     @app.post("/v2/accounts")
-    async def create_account(body: AccountCreate, _: bool = Depends(verify_admin_password)):
+    async def create_account(body: AccountCreate, _: bool = Depends(verify_console_token)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         acc_id = str(uuid.uuid4())
         other_str = json.dumps(body.other, ensure_ascii=False) if body.other is not None else None
@@ -1213,7 +1171,7 @@ if CONSOLE_ENABLED:
                 traceback.print_exc()
 
     @app.post("/v2/accounts/feed")
-    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_admin_password)):
+    async def create_accounts_feed(request: BatchAccountCreate, _: bool = Depends(verify_console_token)):
         """
         统一的投喂接口，接收账号列表，立即存入并后台异步验证。
         """
@@ -1259,7 +1217,7 @@ if CONSOLE_ENABLED:
         }
 
     @app.get("/v2/accounts")
-    async def list_accounts(_: bool = Depends(verify_admin_password), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
+    async def list_accounts(_: bool = Depends(verify_console_token), enabled: Optional[bool] = None, sort_by: str = "created_at", sort_order: str = "desc"):
         query = "SELECT * FROM accounts"
         params = []
         if enabled is not None:
@@ -1273,18 +1231,18 @@ if CONSOLE_ENABLED:
         return {"accounts": accounts, "count": len(accounts)}
 
     @app.get("/v2/accounts/{account_id}")
-    async def get_account_detail(account_id: str, _: bool = Depends(verify_admin_password)):
+    async def get_account_detail(account_id: str, _: bool = Depends(verify_console_token)):
         return await get_account(account_id)
 
     @app.delete("/v2/accounts/{account_id}")
-    async def delete_account(account_id: str, _: bool = Depends(verify_admin_password)):
+    async def delete_account(account_id: str, _: bool = Depends(verify_console_token)):
         rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
         if rowcount == 0:
             raise HTTPException(status_code=404, detail="Account not found")
         return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
-    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_admin_password)):
+    async def update_account(account_id: str, body: AccountUpdate, _: bool = Depends(verify_console_token)):
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         fields = []
         values: List[Any] = []
@@ -1317,7 +1275,7 @@ if CONSOLE_ENABLED:
         return _row_to_dict(row)
 
     @app.post("/v2/accounts/{account_id}/refresh")
-    async def manual_refresh(account_id: str, _: bool = Depends(verify_admin_password)):
+    async def manual_refresh(account_id: str, _: bool = Depends(verify_console_token)):
         return await refresh_access_token_in_db(account_id)
 
     # ------------------------------------------------------------------------------
