@@ -328,7 +328,7 @@ def get_database_backend() -> DatabaseBackend:
     else:
         # Default to SQLite
         base_dir = Path(__file__).resolve().parent
-        db_path = base_dir / "data.sqlite3"
+        db_path = base_dir / "data" / "data.sqlite3"
         _db = SQLiteBackend(db_path)
         print(f"[DB] Using SQLite backend: {db_path}")
 
