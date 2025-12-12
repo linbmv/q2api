@@ -20,6 +20,7 @@ import httpx
 import tiktoken
 
 from db import init_db, close_db, row_to_dict
+from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 
 # ------------------------------------------------------------------------------
 # Tokenizer
@@ -117,6 +118,7 @@ try:
     _claude_types, _claude_converter, _claude_stream = _load_claude_modules()
     ClaudeRequest = _claude_types.ClaudeRequest
     convert_claude_to_amazonq_request = _claude_converter.convert_claude_to_amazonq_request
+    map_model_name = _claude_converter.map_model_name
     ClaudeStreamHandler = _claude_stream.ClaudeStreamHandler
 except Exception as e:
     print(f"Failed to load Claude modules: {e}")
@@ -125,6 +127,7 @@ except Exception as e:
     class ClaudeRequest(BaseModel):
         pass
     convert_claude_to_amazonq_request = None
+    map_model_name = lambda m: m  # Pass through if module fails to load
     ClaudeStreamHandler = None
 
 # ------------------------------------------------------------------------------
@@ -539,55 +542,36 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         traceback.print_exc()
         raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
 
-    # 2. Send upstream
-    async def _send_upstream_raw() -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any, Optional[AsyncGenerator[Any, None]]]:
-        access = account.get("accessToken")
-        if not access:
-            refreshed = await refresh_access_token_in_db(account["id"])
-            access = refreshed.get("accessToken")
-            if not access:
-                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
-        
-        # We use the modified send_chat_request which accepts raw_payload
-        # and returns (text, text_stream, tracker, event_stream)
-        return await send_chat_request(
-            access_token=access,
-            messages=[], # Not used when raw_payload is present
-            model=req.model,
-            stream=req.stream,
-            client=GLOBAL_CLIENT,
-            raw_payload=aq_request
-        )
-
+    # 2. Post-process: merge consecutive user messages and duplicate toolResults
     try:
-        _, _, tracker, event_stream = await _send_upstream_raw()
-        
-        if not req.stream:
-            # Non-streaming: we need to consume the stream and build response
-            # But wait, send_chat_request with stream=False returns text, but we need structured response
-            # Actually, for Claude format, we might want to parse the events even for non-streaming
-            # to get tool calls etc correctly.
-            # However, our modified send_chat_request returns event_stream if raw_payload is used AND stream=True?
-            # Let's check replicate.py modification.
-            # If stream=False, it returns text. But text might not be enough for tool calls.
-            # For simplicity, let's force stream=True internally and aggregate if req.stream is False.
-            pass
+        conversation_state = aq_request.get("conversationState", {})
+        history = conversation_state.get("history", [])
+
+        if history:
+            # Merge consecutive user messages
+            processed_history = process_history_for_amazonq(history)
+            conversation_state["history"] = processed_history
+            aq_request["conversationState"] = conversation_state
+
+        # Merge duplicate toolResults in currentMessage
+        current_message = conversation_state.get("currentMessage", {})
+        user_input_message = current_message.get("userInputMessage", {})
+        user_input_message_context = user_input_message.get("userInputMessageContext", {})
+
+        tool_results = user_input_message_context.get("toolResults", [])
+        if tool_results:
+            merged_tool_results = merge_duplicate_tool_results(tool_results)
+            user_input_message_context["toolResults"] = merged_tool_results
+            user_input_message["userInputMessageContext"] = user_input_message_context
+            current_message["userInputMessage"] = user_input_message
+            conversation_state["currentMessage"] = current_message
+            aq_request["conversationState"] = conversation_state
     except Exception as e:
-        await _update_stats(account["id"], False)
-        raise
+        # Log but don't fail - the original request might still work
+        traceback.print_exc()
+        print(f"Warning: Post-processing failed: {e}")
 
-    # We always use streaming upstream to handle events properly
-    try:
-        # Force stream=True for upstream to get events
-        # But wait, send_chat_request logic: if stream=True, returns event_stream
-        # We need to call it with stream=True
-        pass
-    except:
-        pass
-        
-    # Re-implementing logic to be cleaner
-    
-    # Always stream from upstream to get full event details
+    # 3. Send upstream - always stream to get full event details for proper tool call handling
     event_iter = None
     first_event_received = False
     try:
@@ -600,7 +584,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         _, _, tracker, event_iter = await send_chat_request(
             access_token=access,
             messages=[],
-            model=req.model,
+            model=map_model_name(req.model),
             stream=True,
             client=GLOBAL_CLIENT,
             raw_payload=aq_request
@@ -816,7 +800,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
     - messages will be converted into "{role}:\n{content}" and injected into template
     - account is chosen randomly among enabled accounts (API key is for authorization only)
     """
-    model = req.model
+    model = map_model_name(req.model)
     do_stream = bool(req.stream)
 
     async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:
