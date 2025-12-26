@@ -789,8 +789,86 @@ async def count_tokens_endpoint(req: ClaudeRequest):
         text_to_count += json.dumps([tool.model_dump() if hasattr(tool, 'model_dump') else tool for tool in req.tools], ensure_ascii=False)
     
     input_tokens = count_tokens(text_to_count, apply_multiplier=True)
-    
+
     return {"input_tokens": input_tokens}
+
+@app.get("/v1/models")
+async def list_models():
+    """
+    List available models (OpenAI-compatible endpoint).
+    Returns models that are actually supported by Amazon Q backend.
+    """
+    # Based on actual testing results
+    supported_models = [
+        {
+            "id": "claude-sonnet-4.5",
+            "object": "model",
+            "created": 1727740800,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-sonnet-4",
+            "object": "model",
+            "created": 1715299200,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-opus-4.5",
+            "object": "model",
+            "created": 1730419200,
+            "owned_by": "anthropic",
+        },
+        # Canonical names with dates
+        {
+            "id": "claude-sonnet-4-20250514",
+            "object": "model",
+            "created": 1715299200,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-sonnet-4-5-20250929",
+            "object": "model",
+            "created": 1727740800,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-opus-4-5-20251101",
+            "object": "model",
+            "created": 1730419200,
+            "owned_by": "anthropic",
+        },
+        # Thinking variants
+        {
+            "id": "claude-sonnet-4-5-20250929-thinking",
+            "object": "model",
+            "created": 1727740800,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-opus-4-5-20251101-thinking",
+            "object": "model",
+            "created": 1730419200,
+            "owned_by": "anthropic",
+        },
+        # Legacy 3.5 models
+        {
+            "id": "claude-3-5-sonnet-20241022",
+            "object": "model",
+            "created": 1729555200,
+            "owned_by": "anthropic",
+        },
+        {
+            "id": "claude-3-5-sonnet-20240620",
+            "object": "model",
+            "created": 1718841600,
+            "owned_by": "anthropic",
+        },
+    ]
+
+    return {
+        "object": "list",
+        "data": supported_models
+    }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] = Depends(require_account)):

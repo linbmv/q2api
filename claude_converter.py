@@ -76,21 +76,24 @@ def map_model_name(claude_model: str) -> str:
     DEFAULT_MODEL = "claude-sonnet-4.5"
 
     # Available models in the service (with KIRO_CLI origin)
-    VALID_MODELS = {"auto", "claude-sonnet-4", "claude-sonnet-4.5", "claude-haiku-4.5", "claude-opus-4.5"}
+    # Based on actual testing: Sonnet 4/4.5 and Opus 4.5 are supported, Haiku 4.5 is NOT
+    VALID_MODELS = {"auto", "claude-sonnet-4", "claude-sonnet-4.5", "claude-opus-4.5"}
 
     # Mapping from canonical names to short names
     CANONICAL_TO_SHORT = {
+        # Sonnet 4
         "claude-sonnet-4-20250514": "claude-sonnet-4",
+        # Sonnet 4.5
         "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-        "claude-haiku-4-5-20251001": "claude-haiku-4.5",
-        # Amazon Q supports Opus with KIRO_CLI origin
+        "claude-sonnet-4-5-20250929-thinking": "claude-sonnet-4-5-20250929",
+        # Opus 4.5
         "claude-opus-4-5-20251101": "claude-opus-4.5",
+        "claude-opus-4-5-20251101-thinking": "claude-opus-4-5-20251101",
         # Legacy Claude 3.5 Sonnet models
         "claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
         "claude-3-5-sonnet-20240620": "claude-sonnet-4.5",
         # Alternative hyphenated format
         "claude-sonnet-4-5": "claude-sonnet-4.5",
-        "claude-haiku-4-5": "claude-haiku-4.5",
         "claude-opus-4-5": "claude-opus-4.5",
     }
 
@@ -607,6 +610,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
 
     # 5. Model
     model_id = map_model_name(req.model)
+    logger.info(f"Model mapping: '{req.model}' -> '{model_id}'")
 
     # 6. User Input Message
     user_input_msg = {
