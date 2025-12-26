@@ -628,8 +628,9 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     # Model ID was already determined above with -thinking detection
     # Sanitize model name for logging: truncate and escape control characters
     if isinstance(req.model, str):
-        safe_model_name = req.model[:50].replace('\n', '\\n').replace('\r', '\\r')
-        if len(req.model) > 50:
+        model_str = req.model
+        safe_model_name = model_str[:50].replace('\n', '\\n').replace('\r', '\\r')
+        if len(model_str) > 50:
             safe_model_name += "..."
     else:
         model_str = str(req.model)
