@@ -793,7 +793,7 @@ async def count_tokens_endpoint(req: ClaudeRequest):
     return {"input_tokens": input_tokens}
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(account: Dict[str, Any] = Depends(require_account)):
     """
     List available models (OpenAI-compatible endpoint).
     Returns models that are actually supported by Amazon Q backend.
@@ -833,19 +833,6 @@ async def list_models():
         },
         {
             "id": "claude-opus-4-5-20251101",
-            "object": "model",
-            "created": 1730419200,
-            "owned_by": "anthropic",
-        },
-        # Thinking variants
-        {
-            "id": "claude-sonnet-4-5-20250929-thinking",
-            "object": "model",
-            "created": 1727740800,
-            "owned_by": "anthropic",
-        },
-        {
-            "id": "claude-opus-4-5-20251101-thinking",
             "object": "model",
             "created": 1730419200,
             "owned_by": "anthropic",

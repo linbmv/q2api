@@ -85,10 +85,8 @@ def map_model_name(claude_model: str) -> str:
         "claude-sonnet-4-20250514": "claude-sonnet-4",
         # Sonnet 4.5
         "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-        "claude-sonnet-4-5-20250929-thinking": "claude-sonnet-4-5-20250929",
         # Opus 4.5
         "claude-opus-4-5-20251101": "claude-opus-4.5",
-        "claude-opus-4-5-20251101-thinking": "claude-opus-4-5-20251101",
         # Legacy Claude 3.5 Sonnet models
         "claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
         "claude-3-5-sonnet-20240620": "claude-sonnet-4.5",
@@ -610,7 +608,14 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
 
     # 5. Model
     model_id = map_model_name(req.model)
-    logger.info(f"Model mapping: '{req.model}' -> '{model_id}'")
+    # Sanitize model name for logging: truncate and escape control characters
+    if isinstance(req.model, str):
+        safe_model_name = req.model[:50].replace('\n', '\\n').replace('\r', '\\r')
+        if len(req.model) > 50:
+            safe_model_name += "..."
+    else:
+        safe_model_name = str(req.model)[:50] + "..."
+    logger.info(f"Model mapping: '{safe_model_name}' -> '{model_id}'")
 
     # 6. User Input Message
     user_input_msg = {
