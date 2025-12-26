@@ -585,7 +585,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             _, _, tracker, event_iter = await send_chat_request(
                 access_token=access,
                 messages=[],
-                model=map_model_name(req.model),
+                model=map_model_name(req.model)[0],  # Get model name, ignore thinking flag
                 stream=True,
                 client=GLOBAL_CLIENT,
                 raw_payload=aq_request
@@ -865,7 +865,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
     - messages will be converted into "{role}:\n{content}" and injected into template
     - account is chosen randomly among enabled accounts (API key is for authorization only)
     """
-    model = map_model_name(req.model)
+    model, _ = map_model_name(req.model)  # Get model name, ignore thinking flag (handled in converter)
     do_stream = bool(req.stream)
 
     async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:

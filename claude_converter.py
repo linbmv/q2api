@@ -67,11 +67,16 @@ def get_current_timestamp() -> str:
     iso_time = now.isoformat(timespec='milliseconds')
     return f"{weekday}, {iso_time}"
 
-def map_model_name(claude_model: str) -> str:
+def map_model_name(claude_model: str) -> tuple[str, bool]:
     """Map Claude model name to Amazon Q model ID.
 
     Accepts both short names (e.g., claude-sonnet-4) and canonical names
     (e.g., claude-sonnet-4-20250514).
+
+    Also detects -thinking suffix and returns a flag to enable thinking mode.
+
+    Returns:
+        tuple: (model_name, should_enable_thinking)
     """
     DEFAULT_MODEL = "claude-sonnet-4.5"
 
@@ -98,26 +103,33 @@ def map_model_name(claude_model: str) -> str:
     # Type safety and normalization
     if not isinstance(claude_model, str):
         logger.warning(f"Invalid model type {type(claude_model)}, falling back to default")
-        return DEFAULT_MODEL
+        return DEFAULT_MODEL, False
 
     # Normalize: strip whitespace, convert to lowercase, limit length
     model_normalized = claude_model.strip().lower()
     if len(model_normalized) > 100:
         logger.warning(f"Model name too long ({len(model_normalized)} chars), falling back to default")
-        return DEFAULT_MODEL
+        return DEFAULT_MODEL, False
+
+    # Check for -thinking suffix and strip it
+    thinking_requested = False
+    if model_normalized.endswith("-thinking"):
+        thinking_requested = True
+        model_normalized = model_normalized[:-9]  # Remove "-thinking"
+        logger.info(f"Detected -thinking suffix, will enable thinking mode for model: {model_normalized}")
 
     # Check if it's a valid short name (but not "auto" which Amazon Q doesn't accept)
     if model_normalized in VALID_MODELS and model_normalized != "auto":
-        return model_normalized
+        return model_normalized, thinking_requested
 
     # Check if it's a canonical name
     if model_normalized in CANONICAL_TO_SHORT:
-        return CANONICAL_TO_SHORT[model_normalized]
+        return CANONICAL_TO_SHORT[model_normalized], thinking_requested
 
     # Unknown model - log warning with truncated name and return default
     truncated_name = claude_model[:50] + "..." if len(claude_model) > 50 else claude_model
     logger.warning(f"Unknown model '{truncated_name}', falling back to default model '{DEFAULT_MODEL}'")
-    return DEFAULT_MODEL
+    return DEFAULT_MODEL, thinking_requested
 
 def extract_text_from_content(content: Union[str, List[Dict[str, Any]]]) -> str:
     """Extract text from Claude content."""
@@ -464,9 +476,16 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     if loop_error:
         raise ValueError(loop_error)
 
+    # Check for thinking mode: either from explicit thinking parameter or -thinking model suffix
     thinking_enabled = is_thinking_mode_enabled(getattr(req, "thinking", None))
-        
-    # 1. Tools
+
+    # 5. Model - check if model name includes -thinking suffix
+    model_id, model_requests_thinking = map_model_name(req.model)
+
+    # Enable thinking if either the parameter or model suffix requests it
+    if model_requests_thinking and not thinking_enabled:
+        thinking_enabled = True
+        logger.info("Enabling thinking mode based on -thinking model suffix")
     aq_tools = []
     long_desc_tools = []
     if req.tools:
@@ -606,8 +625,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     if thinking_enabled:
         formatted_content = _append_thinking_hint(formatted_content)
 
-    # 5. Model
-    model_id = map_model_name(req.model)
+    # Model ID was already determined above with -thinking detection
     # Sanitize model name for logging: truncate and escape control characters
     if isinstance(req.model, str):
         safe_model_name = req.model[:50].replace('\n', '\\n').replace('\r', '\\r')
