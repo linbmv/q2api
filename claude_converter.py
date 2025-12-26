@@ -88,20 +88,34 @@ def map_model_name(claude_model: str) -> str:
         # Legacy Claude 3.5 Sonnet models
         "claude-3-5-sonnet-20241022": "claude-sonnet-4.5",
         "claude-3-5-sonnet-20240620": "claude-sonnet-4.5",
+        # Alternative hyphenated format
+        "claude-sonnet-4-5": "claude-sonnet-4.5",
+        "claude-haiku-4-5": "claude-haiku-4.5",
+        "claude-opus-4-5": "claude-opus-4.5",
     }
 
-    model_lower = claude_model.lower()
+    # Type safety and normalization
+    if not isinstance(claude_model, str):
+        logger.warning(f"Invalid model type {type(claude_model)}, falling back to default")
+        return DEFAULT_MODEL
+
+    # Normalize: strip whitespace, convert to lowercase, limit length
+    model_normalized = claude_model.strip().lower()
+    if len(model_normalized) > 100:
+        logger.warning(f"Model name too long ({len(model_normalized)} chars), falling back to default")
+        return DEFAULT_MODEL
 
     # Check if it's a valid short name (but not "auto" which Amazon Q doesn't accept)
-    if model_lower in VALID_MODELS and model_lower != "auto":
-        return model_lower
+    if model_normalized in VALID_MODELS and model_normalized != "auto":
+        return model_normalized
 
     # Check if it's a canonical name
-    if model_lower in CANONICAL_TO_SHORT:
-        return CANONICAL_TO_SHORT[model_lower]
+    if model_normalized in CANONICAL_TO_SHORT:
+        return CANONICAL_TO_SHORT[model_normalized]
 
-    # Unknown model - log warning and return default
-    logger.warning(f"Unknown model '{claude_model}', falling back to default model '{DEFAULT_MODEL}'")
+    # Unknown model - log warning with truncated name and return default
+    truncated_name = claude_model[:50] + "..." if len(claude_model) > 50 else claude_model
+    logger.warning(f"Unknown model '{truncated_name}', falling back to default model '{DEFAULT_MODEL}'")
     return DEFAULT_MODEL
 
 def extract_text_from_content(content: Union[str, List[Dict[str, Any]]]) -> str:
