@@ -614,7 +614,10 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
         if len(req.model) > 50:
             safe_model_name += "..."
     else:
-        safe_model_name = str(req.model)[:50] + "..."
+        model_str = str(req.model)
+        safe_model_name = model_str[:50]
+        if len(model_str) > 50:
+            safe_model_name += "..."
     logger.info(f"Model mapping: '{safe_model_name}' -> '{model_id}'")
 
     # 6. User Input Message
