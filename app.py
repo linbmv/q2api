@@ -579,17 +579,23 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         if not access:
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
-        
+
         # We call with stream=True to get the event iterator
-        _, _, tracker, event_iter = await send_chat_request(
-            access_token=access,
-            messages=[],
-            model=map_model_name(req.model),
-            stream=True,
-            client=GLOBAL_CLIENT,
-            raw_payload=aq_request
-        )
-        
+        try:
+            _, _, tracker, event_iter = await send_chat_request(
+                access_token=access,
+                messages=[],
+                model=map_model_name(req.model),
+                stream=True,
+                client=GLOBAL_CLIENT,
+                raw_payload=aq_request
+            )
+        except httpx.HTTPError as e:
+            error_msg = str(e)
+            if "Upstream error" in error_msg and "500" in error_msg:
+                raise HTTPException(status_code=400, detail=f"Model not supported by Amazon Q backend: {req.model}")
+            raise HTTPException(status_code=502, detail=f"Amazon Q backend error: {error_msg}")
+
         if not event_iter:
              raise HTTPException(status_code=502, detail="No event stream returned")
 
@@ -796,9 +802,9 @@ async def count_tokens_endpoint(req: ClaudeRequest):
 async def list_models(account: Dict[str, Any] = Depends(require_account)):
     """
     List available models (OpenAI-compatible endpoint).
-    Returns models that are actually supported by Amazon Q backend.
+    Returns only models confirmed working by actual testing.
     """
-    # Based on actual testing results
+    # Based on actual testing: only these 4 models work
     supported_models = [
         {
             "id": "claude-sonnet-4.5",
@@ -807,9 +813,9 @@ async def list_models(account: Dict[str, Any] = Depends(require_account)):
             "owned_by": "anthropic",
         },
         {
-            "id": "claude-sonnet-4",
+            "id": "claude-haiku-4.5",
             "object": "model",
-            "created": 1715299200,
+            "created": 1730419200,
             "owned_by": "anthropic",
         },
         {
@@ -819,12 +825,6 @@ async def list_models(account: Dict[str, Any] = Depends(require_account)):
             "owned_by": "anthropic",
         },
         # Canonical names with dates
-        {
-            "id": "claude-sonnet-4-20250514",
-            "object": "model",
-            "created": 1715299200,
-            "owned_by": "anthropic",
-        },
         {
             "id": "claude-sonnet-4-5-20250929",
             "object": "model",
@@ -837,7 +837,7 @@ async def list_models(account: Dict[str, Any] = Depends(require_account)):
             "created": 1730419200,
             "owned_by": "anthropic",
         },
-        # Legacy 3.5 models
+        # Legacy 3.5 models (mapped to sonnet-4.5)
         {
             "id": "claude-3-5-sonnet-20241022",
             "object": "model",

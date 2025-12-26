@@ -76,13 +76,13 @@ def map_model_name(claude_model: str) -> str:
     DEFAULT_MODEL = "claude-sonnet-4.5"
 
     # Available models in the service (with KIRO_CLI origin)
-    # Based on actual testing: Sonnet 4/4.5 and Opus 4.5 are supported, Haiku 4.5 is NOT
-    VALID_MODELS = {"auto", "claude-sonnet-4", "claude-sonnet-4.5", "claude-opus-4.5"}
+    # Based on actual testing: Sonnet 4.5, Haiku 4.5, and Opus 4.5 are supported
+    VALID_MODELS = {"auto", "claude-sonnet-4.5", "claude-haiku-4.5", "claude-opus-4.5"}
 
     # Mapping from canonical names to short names
     CANONICAL_TO_SHORT = {
-        # Sonnet 4
-        "claude-sonnet-4-20250514": "claude-sonnet-4",
+        # Sonnet 4 -> map to 4.5 (Sonnet 4 not supported by backend)
+        "claude-sonnet-4-20250514": "claude-sonnet-4.5",
         # Sonnet 4.5
         "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
         # Opus 4.5
