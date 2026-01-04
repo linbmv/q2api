@@ -7,6 +7,7 @@ import asyncio
 import importlib.util
 import random
 import secrets
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
@@ -631,7 +632,13 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             raise HTTPException(status_code=502, detail="Empty response from upstream")
         except Exception as e:
             # If we get an error before the first event, we can still return proper status code
-            raise HTTPException(status_code=502, detail=f"Upstream error: {str(e)}")
+            err_msg = str(e)
+            # Extract upstream status code from "Upstream error {code}: {message}"
+            if err_msg.startswith("Upstream error "):
+                match = re.match(r"Upstream error (\d+):", err_msg)
+                if match:
+                    raise HTTPException(status_code=int(match.group(1)), detail=err_msg)
+            raise HTTPException(status_code=502, detail=f"Upstream error: {err_msg}")
 
         async def event_generator():
             try:
