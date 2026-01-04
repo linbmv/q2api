@@ -94,7 +94,8 @@ class SQLiteBackend(DatabaseBackend):
                 updated_at TEXT,
                 enabled INTEGER DEFAULT 1,
                 error_count INTEGER DEFAULT 0,
-                success_count INTEGER DEFAULT 0
+                success_count INTEGER DEFAULT 0,
+                expires_at TEXT
             )
         """)
         
@@ -102,6 +103,15 @@ class SQLiteBackend(DatabaseBackend):
         await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_enabled ON accounts (enabled);")
         await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts (created_at);")
         await self._conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_success_count ON accounts (success_count);")
+
+        # Add expires_at column if missing (migration)
+        try:
+            async with self._conn.execute("PRAGMA table_info(accounts)") as cursor:
+                cols = {row[1] for row in await cursor.fetchall()}
+                if "expires_at" not in cols:
+                    await self._conn.execute("ALTER TABLE accounts ADD COLUMN expires_at TEXT")
+        except Exception:
+            pass
 
         await self._conn.commit()
         self._initialized = True
@@ -160,9 +170,15 @@ class PostgresBackend(DatabaseBackend):
                     updated_at TEXT,
                     enabled INTEGER DEFAULT 1,
                     error_count INTEGER DEFAULT 0,
-                    success_count INTEGER DEFAULT 0
+                    success_count INTEGER DEFAULT 0,
+                    expires_at TEXT
                 )
             """)
+            # Add column if missing (migration)
+            try:
+                await conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS expires_at TEXT")
+            except Exception:
+                pass
         self._initialized = True
 
     async def close(self) -> None:
@@ -267,9 +283,15 @@ class MySQLBackend(DatabaseBackend):
                         updated_at TEXT,
                         enabled INT DEFAULT 1,
                         error_count INT DEFAULT 0,
-                        success_count INT DEFAULT 0
+                        success_count INT DEFAULT 0,
+                        expires_at TEXT
                     )
                 """)
+                # Add column if missing (migration)
+                try:
+                    await cur.execute("ALTER TABLE accounts ADD COLUMN expires_at TEXT")
+                except Exception:
+                    pass  # Column already exists
         self._initialized = True
 
     async def close(self) -> None:

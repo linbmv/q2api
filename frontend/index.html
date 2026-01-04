@@ -301,17 +301,23 @@
 
     <div id="tab-chat" class="tab-content">
       <div class="panel">
-        <h2>Chat 测试（OpenAI 兼容 /v1/chat/completions）</h2>
+        <h2>Chat 测试（/v2/chat/test）</h2>
         <div class="row">
           <div class="field" style="max-width:300px">
             <label>model</label>
-            <input id="model" value="claude-sonnet-4" />
+            <input id="model" value="claude-haiku-4.5" />
           </div>
           <div class="field" style="max-width:180px">
             <label>是否流式</label>
             <select id="stream">
               <option value="false">false（默认）</option>
               <option value="true">true（SSE）</option>
+            </select>
+          </div>
+          <div class="field" style="max-width:200px">
+            <label>账号</label>
+            <select id="chatAccount">
+              <option value="">随机</option>
             </select>
           </div>
           <button class="right" onclick="send()">发送请求</button>
@@ -683,7 +689,7 @@ class VirtualScroll {
 function renderAccounts(list){
   accountsData = list;
   const root = document.getElementById('accounts');
-  
+
   if (!Array.isArray(list) || list.length === 0) {
     if (virtualScroll) {
       virtualScroll.destroy();
@@ -696,15 +702,29 @@ function renderAccounts(list){
     root.appendChild(empty);
     return;
   }
-  
+
   // Estimate item height (card height ~280px with gap)
   const estimatedItemHeight = 292;
-  
+
   if (virtualScroll) {
     virtualScroll.update(list);
   } else {
     virtualScroll = new VirtualScroll(root, list, estimatedItemHeight);
   }
+}
+
+function populateChatAccountSelector(accounts) {
+  const sel = document.getElementById('chatAccount');
+  if (!sel) return;
+  const current = sel.value;
+  sel.innerHTML = '<option value="">随机</option>';
+  (accounts || []).forEach(acc => {
+    const opt = document.createElement('option');
+    opt.value = acc.id;
+    opt.textContent = (acc.label || acc.id) + (acc.enabled ? '' : ' (禁用)');
+    sel.appendChild(opt);
+  });
+  if (current) sel.value = current;
 }
 
 async function loadAccounts(){
@@ -723,6 +743,7 @@ async function loadAccounts(){
     const j = await r.json();
     document.getElementById('accountCount').textContent = `(${j.count})`;
     renderAccounts(j.accounts);
+    populateChatAccountSelector(j.accounts);
   } catch(e){
     alert('加载账户失败：' + e);
   }
@@ -845,6 +866,7 @@ async function refreshAccount(id){
 async function send() {
   const model = document.getElementById('model').value.trim();
   const stream = document.getElementById('stream').value === 'true';
+  const accountId = document.getElementById('chatAccount')?.value || '';
   const out = document.getElementById('out');
   out.textContent = '';
 
@@ -854,9 +876,10 @@ async function send() {
 
   const body = { model, messages, stream };
   const headers = { 'content-type': 'application/json' };
+  const endpoint = accountId ? `/v2/chat/test?account_id=${encodeURIComponent(accountId)}` : '/v2/chat/test';
 
   if (!stream) {
-    const r = await fetch(api('/v1/chat/completions'), {
+    const r = await authFetch(api(endpoint), {
       method:'POST',
       headers,
       body: JSON.stringify(body)
@@ -865,7 +888,7 @@ async function send() {
     try { out.textContent = JSON.stringify(JSON.parse(text), null, 2); }
     catch { out.textContent = text; }
   } else {
-    const r = await fetch(api('/v1/chat/completions'), {
+    const r = await authFetch(api(endpoint), {
       method:'POST',
       headers,
       body: JSON.stringify(body)
