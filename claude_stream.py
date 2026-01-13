@@ -89,6 +89,8 @@ class ClaudeStreamHandler:
         self.tool_name: Optional[str] = None
         self._processed_tool_use_ids: Set[str] = set()
         self.all_tool_inputs: List[str] = []
+        self.has_tool_use: bool = False  # Track if any tool_use was emitted
+        self.response_ended: bool = False  # Track if response has ended
 
         # Think tag state
         self.in_think_block: bool = False
@@ -97,7 +99,11 @@ class ClaudeStreamHandler:
 
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
-        
+
+        # Early return if response has already ended
+        if self.response_ended:
+            return
+
         # 1. Message Start (initial-response)
         if event_type == "initial-response":
             if not self.message_start_sent:
@@ -250,6 +256,7 @@ class ClaudeStreamHandler:
                 self.tool_input_buffer = []
                 self.content_block_stop_sent = False
                 self.content_block_start_sent = True
+                self.has_tool_use = True  # Mark that we have tool_use
 
             # Accumulate input
             if self.current_tool_use and tool_input:
@@ -282,8 +289,23 @@ class ClaudeStreamHandler:
                 yield build_content_block_stop(self.content_block_index)
                 self.content_block_stop_sent = True
 
+            # Mark as finished to prevent processing further events
+            self.response_ended = True
+
+            # Immediately send message_stop (instead of waiting for finish())
+            full_text = "".join(self.response_buffer)
+            full_tool_input = "".join(self.all_tool_inputs)
+            output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
+            # Use "tool_use" stop_reason if any tool_use was emitted, otherwise "end_turn"
+            stop_reason = "tool_use" if self.has_tool_use else "end_turn"
+            yield build_message_stop(self.input_tokens, output_tokens, stop_reason)
+
     async def finish(self) -> AsyncGenerator[str, None]:
         """Send final events."""
+        # Skip if response already ended (message_stop was sent in handle_event)
+        if self.response_ended:
+            return
+
         # Ensure last block is closed
         if self.content_block_started and not self.content_block_stop_sent:
             yield build_content_block_stop(self.content_block_index)
@@ -296,4 +318,6 @@ class ClaudeStreamHandler:
         # output_tokens = max(1, (len(full_text) + len(full_tool_input)) // 4)
         output_tokens = count_tokens(full_text) + count_tokens(full_tool_input)
 
-        yield build_message_stop(self.input_tokens, output_tokens, "end_turn")
+        # Use "tool_use" stop_reason if any tool_use was emitted, otherwise "end_turn"
+        stop_reason = "tool_use" if self.has_tool_use else "end_turn"
+        yield build_message_stop(self.input_tokens, output_tokens, stop_reason)
