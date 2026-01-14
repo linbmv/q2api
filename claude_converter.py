@@ -280,7 +280,8 @@ def _reorder_tool_results_by_tool_uses(tool_results: List[Dict[str, Any]], tool_
     if not tool_use_order or not tool_results:
         return tool_results
 
-    result_by_id = {r["toolUseId"]: r for r in tool_results}
+    result_by_id = {r.get("toolUseId"): r for r in tool_results if r.get("toolUseId")}
+    results_without_id = [r for r in tool_results if not r.get("toolUseId")]
     ordered_results = []
 
     # Add results in the order of tool_uses
@@ -290,6 +291,7 @@ def _reorder_tool_results_by_tool_uses(tool_results: List[Dict[str, Any]], tool_
 
     # Add any remaining results not in the original order (shouldn't happen normally)
     ordered_results.extend(result_by_id.values())
+    ordered_results.extend(results_without_id)
 
     return ordered_results
 

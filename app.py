@@ -409,7 +409,7 @@ async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
 
         new_access = data.get("accessToken")
         new_refresh = data.get("refreshToken", acc.get("refreshToken"))
-        expires_in = data.get("expiresIn", 3600)  # Default 1 hour if not provided
+        expires_in = int(data.get("expiresIn", 3600))
         expires_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + expires_in))
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         status = "success"
@@ -548,6 +548,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
     # 2. Post-process: merge consecutive user messages and duplicate toolResults
     try:
         conversation_state = aq_request.get("conversationState", {})
+        conversation_id = conversation_state.get("conversationId") or str(uuid.uuid4())
         history = conversation_state.get("history", [])
 
         if history:
@@ -1347,7 +1348,7 @@ if CONSOLE_ENABLED:
         return await refresh_access_token_in_db(account_id)
 
     @app.post("/v2/chat/test")
-    async def admin_chat_test(req: ChatCompletionRequest, account_id: Optional[str] = None, _: bool = Depends(verify_admin_password)):
+    async def admin_chat_test(req: ChatCompletionRequest, account_id: Optional[str] = None, _: bool = Depends(verify_console_token)):
         """Admin chat test - uses admin auth, selects account by id or random."""
         if account_id:
             row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
@@ -1364,6 +1365,10 @@ if CONSOLE_ENABLED:
             if not candidates:
                 raise HTTPException(status_code=503, detail="No enabled account available")
             account = random.choice(candidates)
+            expires_at = account.get("expires_at")
+            now_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+            if not expires_at or expires_at <= now_str:
+                account = await refresh_access_token_in_db(account["id"])
         return await chat_completions(req, account)
 
     # ------------------------------------------------------------------------------

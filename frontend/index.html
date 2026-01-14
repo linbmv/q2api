@@ -879,7 +879,7 @@ async function send() {
   const endpoint = accountId ? `/v2/chat/test?account_id=${encodeURIComponent(accountId)}` : '/v2/chat/test';
 
   if (!stream) {
-    const r = await authFetch(api(endpoint), {
+    const r = await fetch(api(endpoint), {
       method:'POST',
       headers,
       body: JSON.stringify(body)
@@ -888,7 +888,7 @@ async function send() {
     try { out.textContent = JSON.stringify(JSON.parse(text), null, 2); }
     catch { out.textContent = text; }
   } else {
-    const r = await authFetch(api(endpoint), {
+    const r = await fetch(api(endpoint), {
       method:'POST',
       headers,
       body: JSON.stringify(body)
