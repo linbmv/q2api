@@ -126,9 +126,9 @@ def map_model_name(claude_model: str) -> tuple[str, bool]:
     if model_normalized in CANONICAL_TO_SHORT:
         return CANONICAL_TO_SHORT[model_normalized], thinking_requested
 
-    # Unknown model - log warning with truncated name and return default
+    # Unknown model - log debug with truncated name and return default
     truncated_name = claude_model[:50] + "..." if len(claude_model) > 50 else claude_model
-    logger.warning(f"Unknown model '{truncated_name}', falling back to default model '{DEFAULT_MODEL}'")
+    logger.debug(f"Unknown model '{truncated_name}', falling back to default model '{DEFAULT_MODEL}'")
     return DEFAULT_MODEL, thinking_requested
 
 def extract_text_from_content(content: Union[str, List[Dict[str, Any]]]) -> str:

@@ -129,14 +129,14 @@ class EventStreamDecoder:
                 prelude_crc_expected = struct.unpack('>I', message_data[8:12])[0]
                 prelude_crc_actual = crc32c(message_data[0:8])
                 if prelude_crc_expected != prelude_crc_actual:
-                    logger.warning(f"Prelude CRC mismatch: expected {prelude_crc_expected:#x}, got {prelude_crc_actual:#x}")
+                    logger.debug(f"Prelude CRC mismatch: expected {prelude_crc_expected:#x}, got {prelude_crc_actual:#x}")
                     self.crc_errors += 1
                     return False
 
                 message_crc_expected = struct.unpack('>I', message_data[-4:])[0]
                 message_crc_actual = crc32c(message_data[:-4])
                 if message_crc_expected != message_crc_actual:
-                    logger.warning(f"Message CRC mismatch: expected {message_crc_expected:#x}, got {message_crc_actual:#x}")
+                    logger.debug(f"Message CRC mismatch: expected {message_crc_expected:#x}, got {message_crc_actual:#x}")
                     self.crc_errors += 1
                     return False
 
@@ -311,13 +311,13 @@ class EventStreamParser:
                 prelude_crc_expected = struct.unpack('>I', data[8:12])[0]
                 prelude_crc_actual = crc32c(data[0:8])
                 if prelude_crc_expected != prelude_crc_actual:
-                    logger.warning(f"Prelude CRC mismatch: {prelude_crc_expected:#x} != {prelude_crc_actual:#x}")
+                    logger.debug(f"Prelude CRC mismatch: {prelude_crc_expected:#x} != {prelude_crc_actual:#x}")
                     return None
 
                 message_crc_expected = struct.unpack('>I', data[-4:])[0]
                 message_crc_actual = crc32c(data[:-4])
                 if message_crc_expected != message_crc_actual:
-                    logger.warning(f"Message CRC mismatch: {message_crc_expected:#x} != {message_crc_actual:#x}")
+                    logger.debug(f"Message CRC mismatch: {message_crc_expected:#x} != {message_crc_actual:#x}")
                     return None
 
             headers_data = data[12:12 + headers_length]
