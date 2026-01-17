@@ -16,6 +16,8 @@ ALLOWED_CANONICAL_MODELS: Set[str] = {
     "claude-sonnet-4.5",
     "claude-sonnet-4",
     "claude-sonnet-3.5",
+    "claude-haiku-4.5",
+    "claude-opus-4.5",
 }
 
 # 默认规范模型（验证有效性）
