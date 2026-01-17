@@ -15,8 +15,18 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 # Install maturin
 RUN pip install --no-cache-dir maturin
 
-# Copy Rust project
 WORKDIR /build
+
+# Cache dependencies: copy only Cargo files first
+COPY rust/q2api-core/Cargo.toml rust/q2api-core/Cargo.lock* /build/
+
+# Create dummy source to build dependencies
+RUN mkdir -p src && echo "pub fn dummy() {}" > src/lib.rs
+
+# Build dependencies only (cached unless Cargo.toml changes)
+RUN cargo build --release || true
+
+# Copy actual source and rebuild
 COPY rust/q2api-core/ /build/
 
 # Build the wheel
@@ -43,6 +53,7 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm -f /tmp/*.whl
 
 # Copy application code
 COPY *.py /app/
+COPY frontend/ /app/frontend/
 
 # Expose port 8000
 EXPOSE 8000
