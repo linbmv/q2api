@@ -104,16 +104,15 @@ impl EventStreamDecoder {
             return Ok(None);
         }
 
-        let message_data = self.buffer.split_to(total_length as usize);
-
+        // Validate CRC BEFORE consuming bytes to preserve stream sync on failure
         if self.validate_crc {
             let prelude_crc_expected = u32::from_be_bytes([
-                message_data[8],
-                message_data[9],
-                message_data[10],
-                message_data[11],
+                self.buffer[8],
+                self.buffer[9],
+                self.buffer[10],
+                self.buffer[11],
             ]);
-            let prelude_crc_actual = crc32c::crc32c(&message_data[0..8]);
+            let prelude_crc_actual = crc32c::crc32c(&self.buffer[0..8]);
             if prelude_crc_expected != prelude_crc_actual {
                 self.crc_errors += 1;
                 return Err(ParseError::PreludeCrcMismatch {
@@ -122,14 +121,14 @@ impl EventStreamDecoder {
                 });
             }
 
-            let msg_len = message_data.len();
+            let msg_len = total_length as usize;
             let message_crc_expected = u32::from_be_bytes([
-                message_data[msg_len - 4],
-                message_data[msg_len - 3],
-                message_data[msg_len - 2],
-                message_data[msg_len - 1],
+                self.buffer[msg_len - 4],
+                self.buffer[msg_len - 3],
+                self.buffer[msg_len - 2],
+                self.buffer[msg_len - 1],
             ]);
-            let message_crc_actual = crc32c::crc32c(&message_data[..msg_len - 4]);
+            let message_crc_actual = crc32c::crc32c(&self.buffer[..msg_len - 4]);
             if message_crc_expected != message_crc_actual {
                 self.crc_errors += 1;
                 return Err(ParseError::MessageCrcMismatch {
@@ -138,6 +137,9 @@ impl EventStreamDecoder {
                 });
             }
         }
+
+        // Only consume bytes after CRC validation passes
+        let message_data = self.buffer.split_to(total_length as usize);
 
         let headers_length = u32::from_be_bytes([
             message_data[4],

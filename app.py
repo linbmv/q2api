@@ -18,19 +18,19 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Fil
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
-import tiktoken
 
 from db import init_db, close_db, row_to_dict
 from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 
 # ------------------------------------------------------------------------------
-# Tokenizer
+# Tokenizer (optional - fallback to estimation if tiktoken unavailable)
 # ------------------------------------------------------------------------------
 
 try:
-    # cl100k_base is used by gpt-4, gpt-3.5-turbo, text-embedding-ada-002
+    import tiktoken
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except Exception:
+    tiktoken = None
     ENCODING = None
 
 def count_tokens(text: str, apply_multiplier: bool = False) -> int:

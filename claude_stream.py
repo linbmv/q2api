@@ -4,17 +4,18 @@ import importlib.util
 import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Optional, Dict, Any, List, Set
-import tiktoken
 
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
-# Tokenizer
+# Tokenizer (optional - fallback to estimation if tiktoken unavailable)
 # ------------------------------------------------------------------------------
 
 try:
+    import tiktoken
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except Exception:
+    tiktoken = None
     ENCODING = None
 
 THINKING_START_TAG = "<thinking>"
@@ -40,52 +41,90 @@ def count_tokens(text: str) -> int:
 # Smart Tag Detection (ported from kiro.rs)
 # ------------------------------------------------------------------------------
 
-def _is_inside_quotes(text: str, pos: int) -> bool:
-    """Check if position is inside single/double quotes or backticks.
+class QuoteState:
+    """Persistent quote state tracker for cross-chunk detection."""
+    __slots__ = ('in_single', 'in_double', 'in_backtick', 'in_triple_backtick')
 
-    Handles escape sequences: \\\" and \\' are not treated as quote boundaries.
-    """
-    in_single = False
-    in_double = False
-    in_backtick = False
-    in_triple_backtick = False
-    i = 0
+    def __init__(self):
+        self.in_single = False
+        self.in_double = False
+        self.in_backtick = False
+        self.in_triple_backtick = False
 
-    while i < pos:
-        # Check for triple backticks first
-        if i + 2 < len(text) and text[i:i+3] == '```':
-            in_triple_backtick = not in_triple_backtick
-            i += 3
-            continue
+    def is_inside_quotes(self) -> bool:
+        return self.in_single or self.in_double or self.in_backtick or self.in_triple_backtick
 
-        ch = text[i]
-
-        # Check for escape sequences (skip next char if current is backslash)
-        if ch == '\\' and i + 1 < len(text):
-            next_ch = text[i + 1]
-            if next_ch in ('"', "'", '`', '\\'):
-                i += 2  # Skip both the backslash and escaped character
+    def update(self, text: str) -> None:
+        """Update quote state by scanning text."""
+        i = 0
+        while i < len(text):
+            if i + 2 < len(text) and text[i:i+3] == '```':
+                self.in_triple_backtick = not self.in_triple_backtick
+                i += 3
                 continue
+            ch = text[i]
+            if ch == '\\' and i + 1 < len(text):
+                next_ch = text[i + 1]
+                if next_ch in ('"', "'", '`', '\\'):
+                    i += 2
+                    continue
+            if ch == '`' and not self.in_triple_backtick and not self.in_single and not self.in_double:
+                self.in_backtick = not self.in_backtick
+            elif ch == '"' and not self.in_single and not self.in_backtick and not self.in_triple_backtick:
+                self.in_double = not self.in_double
+            elif ch == "'" and not self.in_double and not self.in_backtick and not self.in_triple_backtick:
+                self.in_single = not self.in_single
+            i += 1
 
-        if ch == '`' and not in_triple_backtick and not in_single and not in_double:
-            in_backtick = not in_backtick
-        elif ch == '"' and not in_single and not in_backtick and not in_triple_backtick:
-            in_double = not in_double
-        elif ch == "'" and not in_double and not in_backtick and not in_triple_backtick:
-            in_single = not in_single
+    def check_at_position(self, text: str, pos: int) -> bool:
+        """Check if position in text is inside quotes (stateless check from start)."""
+        in_single = self.in_single
+        in_double = self.in_double
+        in_backtick = self.in_backtick
+        in_triple_backtick = self.in_triple_backtick
+        i = 0
+        while i < pos:
+            if i + 2 < len(text) and text[i:i+3] == '```':
+                in_triple_backtick = not in_triple_backtick
+                i += 3
+                continue
+            ch = text[i]
+            if ch == '\\' and i + 1 < len(text):
+                next_ch = text[i + 1]
+                if next_ch in ('"', "'", '`', '\\'):
+                    i += 2
+                    continue
+            if ch == '`' and not in_triple_backtick and not in_single and not in_double:
+                in_backtick = not in_backtick
+            elif ch == '"' and not in_single and not in_backtick and not in_triple_backtick:
+                in_double = not in_double
+            elif ch == "'" and not in_double and not in_backtick and not in_triple_backtick:
+                in_single = not in_single
+            i += 1
+        return in_single or in_double or in_backtick or in_triple_backtick
 
-        i += 1
+    def reset(self) -> None:
+        self.in_single = False
+        self.in_double = False
+        self.in_backtick = False
+        self.in_triple_backtick = False
 
-    return in_single or in_double or in_backtick or in_triple_backtick
+def _is_inside_quotes(text: str, pos: int) -> bool:
+    """Check if position is inside single/double quotes or backticks (stateless)."""
+    state = QuoteState()
+    return state.check_at_position(text, pos)
 
-def find_real_tag(text: str, tag: str, start: int = 0) -> int:
+def find_real_tag(text: str, tag: str, start: int = 0, quote_state: QuoteState = None) -> int:
     """Find tag that is not inside quotes/backticks."""
     pos = start
     while True:
         idx = text.find(tag, pos)
         if idx == -1:
             return -1
-        if not _is_inside_quotes(text, idx):
+        if quote_state:
+            if not quote_state.check_at_position(text, idx):
+                return idx
+        elif not _is_inside_quotes(text, idx):
             return idx
         pos = idx + 1
     return -1
@@ -150,6 +189,7 @@ class ClaudeStreamHandler:
         self.in_think_block: bool = False
         self.think_buffer: str = ""
         self.pending_start_tag_chars: int = 0
+        self.quote_state: QuoteState = QuoteState()  # Persistent quote state
 
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
@@ -195,7 +235,7 @@ class ClaudeStreamHandler:
                             continue
 
                     if not self.in_think_block:
-                        think_start = find_real_tag(self.think_buffer, THINKING_START_TAG)
+                        think_start = find_real_tag(self.think_buffer, THINKING_START_TAG, 0, self.quote_state)
                         if think_start == -1:
                             pending = _pending_tag_suffix(self.think_buffer, THINKING_START_TAG)
                             if pending == len(self.think_buffer) and pending > 0:
@@ -227,6 +267,7 @@ class ClaudeStreamHandler:
                                     self.content_block_stop_sent = False
                                 self.response_buffer.append(text_chunk)
                                 yield build_content_block_delta(self.content_block_index, text_chunk)
+                                self.quote_state.update(text_chunk)  # Update quote state after emitting
                             self.think_buffer = self.think_buffer[emit_len:]
                         else:
                             before_text = self.think_buffer[:think_start]
@@ -239,7 +280,9 @@ class ClaudeStreamHandler:
                                     self.content_block_stop_sent = False
                                 self.response_buffer.append(before_text)
                                 yield build_content_block_delta(self.content_block_index, before_text)
+                                self.quote_state.update(before_text)  # Update quote state
                             self.think_buffer = self.think_buffer[think_start + len(THINKING_START_TAG):]
+                            self.quote_state.reset()  # Reset quote state when entering thinking block
 
                             if self.content_block_start_sent:
                                 yield build_content_block_stop(self.content_block_index)
@@ -254,7 +297,7 @@ class ClaudeStreamHandler:
                             self.in_think_block = True
                             self.pending_start_tag_chars = 0
                     else:
-                        think_end = find_real_tag(self.think_buffer, THINKING_END_TAG)
+                        think_end = find_real_tag(self.think_buffer, THINKING_END_TAG, 0, self.quote_state)
                         if think_end == -1:
                             pending = _pending_tag_suffix(self.think_buffer, THINKING_END_TAG)
                             emit_len = len(self.think_buffer) - pending
