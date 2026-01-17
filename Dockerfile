@@ -54,6 +54,7 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm -f /tmp/*.whl
 # Copy application code
 COPY *.py /app/
 COPY frontend/ /app/frontend/
+COPY templates/ /app/templates/
 
 # Expose port 8000
 EXPOSE 8000
