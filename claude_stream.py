@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------------------
 
 try:
-    # cl100k_base is used by gpt-4, gpt-3.5-turbo, text-embedding-ada-002
     ENCODING = tiktoken.get_encoding("cl100k_base")
 except Exception:
     ENCODING = None
@@ -36,6 +35,60 @@ def count_tokens(text: str) -> int:
     if not text or not ENCODING:
         return 0
     return len(ENCODING.encode(text))
+
+# ------------------------------------------------------------------------------
+# Smart Tag Detection (ported from kiro.rs)
+# ------------------------------------------------------------------------------
+
+def _is_inside_quotes(text: str, pos: int) -> bool:
+    """Check if position is inside single/double quotes or backticks.
+
+    Handles escape sequences: \\\" and \\' are not treated as quote boundaries.
+    """
+    in_single = False
+    in_double = False
+    in_backtick = False
+    in_triple_backtick = False
+    i = 0
+
+    while i < pos:
+        # Check for triple backticks first
+        if i + 2 < len(text) and text[i:i+3] == '```':
+            in_triple_backtick = not in_triple_backtick
+            i += 3
+            continue
+
+        ch = text[i]
+
+        # Check for escape sequences (skip next char if current is backslash)
+        if ch == '\\' and i + 1 < len(text):
+            next_ch = text[i + 1]
+            if next_ch in ('"', "'", '`', '\\'):
+                i += 2  # Skip both the backslash and escaped character
+                continue
+
+        if ch == '`' and not in_triple_backtick and not in_single and not in_double:
+            in_backtick = not in_backtick
+        elif ch == '"' and not in_single and not in_backtick and not in_triple_backtick:
+            in_double = not in_double
+        elif ch == "'" and not in_double and not in_backtick and not in_triple_backtick:
+            in_single = not in_single
+
+        i += 1
+
+    return in_single or in_double or in_backtick or in_triple_backtick
+
+def find_real_tag(text: str, tag: str, start: int = 0) -> int:
+    """Find tag that is not inside quotes/backticks."""
+    pos = start
+    while True:
+        idx = text.find(tag, pos)
+        if idx == -1:
+            return -1
+        if not _is_inside_quotes(text, idx):
+            return idx
+        pos = idx + 1
+    return -1
 
 # ------------------------------------------------------------------------------
 # Dynamic Loader
@@ -142,7 +195,7 @@ class ClaudeStreamHandler:
                             continue
 
                     if not self.in_think_block:
-                        think_start = self.think_buffer.find(THINKING_START_TAG)
+                        think_start = find_real_tag(self.think_buffer, THINKING_START_TAG)
                         if think_start == -1:
                             pending = _pending_tag_suffix(self.think_buffer, THINKING_START_TAG)
                             if pending == len(self.think_buffer) and pending > 0:
@@ -201,7 +254,7 @@ class ClaudeStreamHandler:
                             self.in_think_block = True
                             self.pending_start_tag_chars = 0
                     else:
-                        think_end = self.think_buffer.find(THINKING_END_TAG)
+                        think_end = find_real_tag(self.think_buffer, THINKING_END_TAG)
                         if think_end == -1:
                             pending = _pending_tag_suffix(self.think_buffer, THINKING_END_TAG)
                             emit_len = len(self.think_buffer) - pending

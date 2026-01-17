@@ -1,0 +1,28 @@
+[package]
+name = "q2api-core"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance AWS Event Stream parser with CRC32C validation"
+license = "MIT"
+
+[lib]
+name = "q2api_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crc32c = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+bytes = "1.5"
+hex = "0.4"
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
+
+[features]
+default = []
+python = ["pyo3"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

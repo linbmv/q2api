@@ -45,3 +45,6 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Rust
+rust/*/target/

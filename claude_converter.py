@@ -486,14 +486,7 @@ def process_history(messages: List[ClaudeMessage], thinking_enabled: bool = Fals
     return history
 
 def _validate_history_alternation(history: List[Dict[str, Any]]) -> None:
-    """Validate that history messages alternate correctly (user-assistant-user-assistant...).
-
-    This prevents infinite loops caused by malformed message ordering where tool_result
-    ends up above the user message, causing the model to keep executing the same instruction.
-
-    Raises:
-        ValueError: If messages don't alternate properly
-    """
+    """Validate that history messages alternate correctly (user-assistant-user-assistant...)."""
     if not history:
         return
 
@@ -512,6 +505,73 @@ def _validate_history_alternation(history: List[Dict[str, Any]]) -> None:
                 f"This may indicate malformed message ordering that could cause infinite loops."
             )
         prev_role = current_role
+
+
+def _validate_tool_pairing(messages: List[ClaudeMessage], tools: Optional[List[Any]] = None) -> tuple[set, set, List[Dict[str, Any]]]:
+    """Validate tool_use/tool_result pairing and detect orphans.
+
+    Returns:
+        tuple: (orphan_tool_use_ids, orphan_tool_result_ids, placeholder_tools)
+            - orphan_tool_use_ids: tool_use IDs without matching tool_result
+            - orphan_tool_result_ids: tool_result IDs without matching tool_use
+            - placeholder_tools: auto-generated tool definitions for missing tools
+    """
+    tool_use_ids = set()
+    tool_use_names = {}  # id -> name mapping
+    tool_result_ids = set()
+    defined_tool_names = set()
+
+    # Collect defined tool names
+    if tools:
+        for t in tools:
+            defined_tool_names.add(t.name)
+
+    # First pass: collect all tool_use IDs and names from assistant messages
+    for msg in messages:
+        if msg.role == "assistant" and isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = block.get("id")
+                    tname = block.get("name")
+                    if tid:
+                        tool_use_ids.add(tid)
+                        if tname:
+                            tool_use_names[tid] = tname
+
+    # Second pass: collect all tool_result IDs from user messages
+    for msg in messages:
+        if msg.role == "user" and isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tid = block.get("tool_use_id")
+                    if tid:
+                        tool_result_ids.add(tid)
+
+    # Find orphans
+    orphan_tool_use_ids = tool_use_ids - tool_result_ids
+    orphan_tool_result_ids = tool_result_ids - tool_use_ids
+
+    if orphan_tool_use_ids:
+        logger.warning(f"Orphan tool_use without results: {orphan_tool_use_ids}")
+    if orphan_tool_result_ids:
+        logger.warning(f"Orphan tool_result without uses: {orphan_tool_result_ids}")
+
+    # Generate placeholder tools for tool_uses that reference undefined tools
+    placeholder_tools = []
+    used_tool_names = set(tool_use_names.values())
+    missing_tool_names = used_tool_names - defined_tool_names
+
+    for name in missing_tool_names:
+        logger.info(f"Generating placeholder tool definition for: {name}")
+        placeholder_tools.append({
+            "toolSpecification": {
+                "name": name,
+                "description": f"[Auto-generated placeholder] Tool '{name}' was used in conversation history but not defined in current request.",
+                "inputSchema": {"json": {"type": "object", "properties": {}}}
+            }
+        })
+
+    return orphan_tool_use_ids, orphan_tool_result_ids, placeholder_tools
 
 
 def _detect_tool_call_loop(messages: List[ClaudeMessage], threshold: int = 3) -> Optional[str]:
@@ -571,6 +631,10 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     if model_requests_thinking and not thinking_enabled:
         thinking_enabled = True
         logger.info("Enabling thinking mode based on -thinking model suffix")
+
+    # Validate tool pairing and generate placeholders for missing tools
+    _, _, placeholder_tools = _validate_tool_pairing(req.messages, req.tools)
+
     aq_tools = []
     long_desc_tools = []
     if req.tools:
@@ -578,6 +642,9 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             if t.description and len(t.description) > 10240:
                 long_desc_tools.append({"name": t.name, "full_description": t.description})
             aq_tools.append(convert_tool(t))
+
+    # Add placeholder tools for undefined tools used in history
+    aq_tools.extend(placeholder_tools)
             
     # 2. Current Message (last user message)
     last_msg = req.messages[-1] if req.messages else None
