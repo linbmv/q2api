@@ -381,7 +381,7 @@ async def send_chat_request(
                             if chunk:
                                 yield chunk
                     
-                    async for message in EventStreamParser.parse_stream(byte_gen()):
+                    async for message in EventStreamParser.parse_stream(byte_gen(), validate_crc=False):
                         event_info = extract_event_info(message)
                         if event_info:
                             event_type = event_info.get('event_type')
