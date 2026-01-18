@@ -359,7 +359,7 @@ async def send_chat_request(
             err_type = resp.headers.get("x-amzn-errortype")
 
             logging.error(
-                f"Upstream error {resp.status_code} (RequestId={req_id}, ErrType={err_type}): {err_text}"
+                f"Upstream error {resp.status_code} (RequestId={req_id}, ErrType={err_type}, Model={model}): {err_text}"
             )
 
             await resp.aclose()
