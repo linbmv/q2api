@@ -15,6 +15,7 @@ from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
 from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, FileResponse
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import httpx
@@ -59,6 +60,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add validation error handler for detailed 422 error logging
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    import logging
+    logging.error(f"Validation error on {request.method} {request.url.path}")
+    logging.error(f"Request body: {await request.body()}")
+    logging.error(f"Validation errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
 
 # ------------------------------------------------------------------------------
 # Dynamic import of replicate.py to avoid package __init__ needs
