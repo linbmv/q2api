@@ -841,7 +841,7 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     _validate_history_alternation(aq_history)
 
     # 8. Final Body
-    return {
+    result = {
         "conversationState": {
             "conversationId": conversation_id,
             "history": aq_history,
@@ -851,3 +851,11 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             "chatTriggerType": "MANUAL"
         }
     }
+
+    # Debug log for tools
+    if aq_tools:
+        logger.info(f"Converted {len(aq_tools)} tools for Amazon Q")
+        for i, tool in enumerate(aq_tools):
+            logger.debug(f"Tool {i}: {tool}")
+
+    return result
