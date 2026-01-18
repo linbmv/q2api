@@ -7,8 +7,14 @@ class ClaudeMessage(BaseModel):
 
 class ClaudeTool(BaseModel):
     name: str
-    description: Optional[str] = ""
-    input_schema: Dict[str, Any]
+    description: Optional[str] = None
+    input_schema: Optional[Dict[str, Any]] = None
+    type: Optional[str] = None  # For WebSearch: "web_search_20250305"
+    max_uses: Optional[int] = None  # For WebSearch: typically 8
+
+    def is_web_search(self) -> bool:
+        """Check if this is a WebSearch tool"""
+        return self.type is not None and self.type.startswith("web_search")
 
 class ClaudeRequest(BaseModel):
     model: str

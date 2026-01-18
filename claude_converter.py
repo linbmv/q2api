@@ -169,10 +169,22 @@ def extract_images_from_content(content: Union[str, List[Dict[str, Any]]]) -> Op
 
 def convert_tool(tool: ClaudeTool) -> Dict[str, Any]:
     """Convert Claude tool to Amazon Q tool."""
+    # Check if this is a WebSearch tool
+    if tool.is_web_search():
+        # WebSearch tool format
+        result = {
+            "type": tool.type,
+            "name": tool.name
+        }
+        if tool.max_uses is not None:
+            result["max_uses"] = tool.max_uses
+        return result
+
+    # Regular tool format
     desc = tool.description or ""
     if len(desc) > 10240:
         desc = desc[:10100] + "\n\n...(Full description provided in TOOL DOCUMENTATION section)"
-    
+
     return {
         "toolSpecification": {
             "name": tool.name,
