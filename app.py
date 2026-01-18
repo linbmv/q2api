@@ -373,6 +373,8 @@ class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     stream: Optional[bool] = False
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Any] = None
 
 # ------------------------------------------------------------------------------
 # Token refresh (OIDC)
@@ -897,6 +899,11 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
     """
     model, _ = map_model_name(req.model)  # Get model name, ignore thinking flag (handled in converter)
     do_stream = bool(req.stream)
+
+    # Log warning if tools are provided (not yet supported in OpenAI format)
+    if req.tools:
+        import logging
+        logging.warning(f"Tools provided in OpenAI format request but not yet supported. Use Anthropic format (/v1/messages) for tool calling.")
 
     async def _send_upstream(stream: bool) -> Tuple[Optional[str], Optional[AsyncGenerator[str, None]], Any]:
         access = account.get("accessToken")
