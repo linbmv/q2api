@@ -33,8 +33,11 @@ def _pending_tag_suffix(buffer: str, tag: str) -> int:
 
 def count_tokens(text: str) -> int:
     """Counts tokens with tiktoken."""
-    if not text or not ENCODING:
+    if not text:
         return 0
+    if not ENCODING:
+        # Fallback: rough estimate (1 token ≈ 4 chars)
+        return len(text) // 4
     return len(ENCODING.encode(text))
 
 # ------------------------------------------------------------------------------

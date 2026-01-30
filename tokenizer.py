@@ -18,8 +18,11 @@ def count_tokens(text: str) -> int:
         text: 要计数的文本
 
     Returns:
-        token 数量，如果 tiktoken 不可用则返回 0
+        token 数量，如果 tiktoken 不可用则使用 fallback 估算
     """
-    if not text or not ENCODING:
+    if not text:
         return 0
+    if not ENCODING:
+        # Fallback: rough estimate (1 token ≈ 4 chars)
+        return len(text) // 4
     return len(ENCODING.encode(text))

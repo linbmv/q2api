@@ -24,6 +24,32 @@ from db import init_db, close_db, row_to_dict
 from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 
 # ------------------------------------------------------------------------------
+# Error helpers (client-facing messages)
+# ------------------------------------------------------------------------------
+
+_GENERIC_HTTP_DETAILS: Dict[int, str] = {
+    400: "Bad request",
+    401: "Unauthorized",
+    404: "Not found",
+    408: "Request timeout",
+    422: "Invalid request",
+    429: "Too many requests",
+    500: "Internal server error",
+    502: "Upstream error",
+    503: "Service unavailable",
+}
+
+def _generic_http_detail(status_code: int) -> str:
+    return _GENERIC_HTTP_DETAILS.get(status_code, "Request failed")
+
+def _validated_status_code(code: Any, *, default: int = 502) -> int:
+    try:
+        code_int = int(code)
+    except Exception:
+        return default
+    return code_int if 100 <= code_int <= 599 else default
+
+# ------------------------------------------------------------------------------
 # Tokenizer (optional - fallback to estimation if tiktoken unavailable)
 # ------------------------------------------------------------------------------
 
@@ -36,9 +62,13 @@ except Exception:
 
 def count_tokens(text: str, apply_multiplier: bool = False) -> int:
     """Counts tokens with tiktoken."""
-    if not text or not ENCODING:
+    if not text:
         return 0
-    token_count = len(ENCODING.encode(text))
+    if not ENCODING:
+        # Fallback: rough estimate (1 token ≈ 4 chars)
+        token_count = len(text) // 4
+    else:
+        token_count = len(ENCODING.encode(text))
     if apply_multiplier:
         token_count = int(token_count * TOKEN_COUNT_MULTIPLIER)
     return token_count
@@ -70,7 +100,7 @@ async def validation_exception_handler(request, exc):
     logging.error(f"Validation errors: {exc.errors()}")
     return JSONResponse(
         status_code=422,
-        content={"detail": exc.errors()}
+        content={"detail": _generic_http_detail(422)}
     )
 
 # ------------------------------------------------------------------------------
@@ -331,13 +361,13 @@ async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
     # Authorization
     if ALLOWED_API_KEYS:
         if not bearer_key or bearer_key not in ALLOWED_API_KEYS:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+            raise HTTPException(status_code=401, detail=_generic_http_detail(401))
 
     # Selection: random among enabled accounts
     candidates = await _list_enabled_accounts()
 
     if not candidates:
-        raise HTTPException(status_code=401, detail="No enabled account available")
+        raise HTTPException(status_code=401, detail=_generic_http_detail(401))
     return random.choice(candidates)
 
 # ------------------------------------------------------------------------------
@@ -395,11 +425,11 @@ def _oidc_headers() -> Dict[str, str]:
 async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
     row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not row:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(status_code=404, detail=_generic_http_detail(404))
     acc = _row_to_dict(row)
 
     if not acc.get("clientId") or not acc.get("clientSecret") or not acc.get("refreshToken"):
-        raise HTTPException(status_code=400, detail="Account missing clientId/clientSecret/refreshToken for refresh")
+        raise HTTPException(status_code=400, detail=_generic_http_detail(400))
 
     payload = {
         "grantType": "refresh_token",
@@ -441,7 +471,7 @@ async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
         )
         # 记录刷新失败次数
         await _update_stats(account_id, False)
-        raise HTTPException(status_code=502, detail=f"Token refresh failed: {str(e)}")
+        raise HTTPException(status_code=502, detail=_generic_http_detail(502))
     except Exception as e:
         # Ensure last_refresh_time is recorded even on unexpected errors
         now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -473,7 +503,7 @@ async def refresh_access_token_in_db(account_id: str) -> Dict[str, Any]:
 async def get_account(account_id: str) -> Dict[str, Any]:
     row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
     if not row:
-        raise HTTPException(status_code=404, detail="Account not found")
+        raise HTTPException(status_code=404, detail=_generic_http_detail(404))
     return _row_to_dict(row)
 
 async def _update_stats(account_id: str, success: bool) -> None:
@@ -509,7 +539,7 @@ async def verify_console_token(authorization: Optional[str] = Header(None)) -> b
 
     bearer = _extract_bearer(authorization)
     if not bearer or bearer != CONSOLE_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid console token")
+        raise HTTPException(status_code=401, detail=_generic_http_detail(401))
     return True
 
 # ------------------------------------------------------------------------------
@@ -553,12 +583,92 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
     """
     Claude-compatible messages endpoint.
     """
+    # 0. Check token limit (150K tokens)
+    text_to_count = ""
+    if req.system:
+        if isinstance(req.system, str):
+            text_to_count += req.system
+        elif isinstance(req.system, list):
+            for item in req.system:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+
+    for msg in req.messages:
+        if isinstance(msg.content, str):
+            text_to_count += msg.content
+        elif isinstance(msg.content, list):
+            for item in msg.content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_to_count += item.get("text", "")
+
+    if req.tools:
+        text_to_count += json.dumps([tool.model_dump() if hasattr(tool, 'model_dump') else tool for tool in req.tools], ensure_ascii=False)
+
+    input_tokens = count_tokens(text_to_count, apply_multiplier=True)
+
+    if input_tokens > 150000:
+        error_message = f"Context too long: {input_tokens} tokens exceeds the 150,000 token limit. Please compress your context and retry."
+
+        if req.stream:
+            async def error_stream():
+                yield _sse_format({
+                    "type": "message_start",
+                    "message": {
+                        "id": f"msg_{uuid.uuid4().hex[:24]}",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": req.model,
+                        "stop_reason": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 0}
+                    }
+                })
+                yield _sse_format({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+                yield _sse_format({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": error_message}})
+                yield _sse_format({"type": "content_block_stop", "index": 0})
+                yield _sse_format({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 0}})
+                yield _sse_format({"type": "message_stop"})
+            return StreamingResponse(error_stream(), media_type="text/event-stream")
+        else:
+            return {
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": error_message}],
+                "model": req.model,
+                "stop_reason": "max_tokens",
+                "usage": {"input_tokens": input_tokens, "output_tokens": len(error_message) // 4}
+            }
+
+    # Auto-truncate context if still over limit after initial check
+    # Keep last N message pairs to stay under 120K tokens (80% of limit)
+    if input_tokens > 120000 and len(req.messages) > 4:
+        # Keep system + last 3 message pairs (6 messages)
+        req.messages = req.messages[-6:]
+        # Recalculate tokens
+        text_to_count = ""
+        if req.system:
+            if isinstance(req.system, str):
+                text_to_count += req.system
+            elif isinstance(req.system, list):
+                for item in req.system:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_to_count += item.get("text", "")
+        for msg in req.messages:
+            if isinstance(msg.content, str):
+                text_to_count += msg.content
+            elif isinstance(msg.content, list):
+                for item in msg.content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_to_count += item.get("text", "")
+        input_tokens = count_tokens(text_to_count, apply_multiplier=True)
+
     # 1. Convert request
     try:
         aq_request = convert_claude_to_amazonq_request(req)
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=400, detail=f"Request conversion failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=_generic_http_detail(400))
 
     # 2. Post-process: merge consecutive user messages and duplicate toolResults
     try:
@@ -612,11 +722,11 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         except httpx.HTTPError as e:
             error_msg = str(e)
             if "Upstream error" in error_msg and "500" in error_msg:
-                raise HTTPException(status_code=400, detail=f"Model not supported by Amazon Q backend: {req.model}")
-            raise HTTPException(status_code=502, detail=f"Amazon Q backend error: {error_msg}")
+                raise HTTPException(status_code=400, detail=_generic_http_detail(400))
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
         if not event_iter:
-             raise HTTPException(status_code=502, detail="No event stream returned")
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
         # Handler
         # Calculate input tokens
@@ -647,7 +757,7 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             first_event = await event_iter.__anext__()
             first_event_received = True
         except StopAsyncIteration:
-            raise HTTPException(status_code=502, detail="Empty response from upstream")
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
         except Exception as e:
             # If we get an error before the first event, we can still return proper status code
             err_msg = str(e)
@@ -655,8 +765,9 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
             if err_msg.startswith("Upstream error "):
                 match = re.match(r"Upstream error (\d+):", err_msg)
                 if match:
-                    raise HTTPException(status_code=int(match.group(1)), detail=err_msg)
-            raise HTTPException(status_code=502, detail=f"Upstream error: {err_msg}")
+                    status_code = _validated_status_code(match.group(1), default=502)
+                    raise HTTPException(status_code=status_code, detail=_generic_http_detail(status_code))
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
         async def event_generator():
             try:
@@ -792,7 +903,8 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
         if err_msg.startswith("Upstream error "):
             match = re.match(r"Upstream error (\d+):", err_msg)
             if match:
-                raise HTTPException(status_code=int(match.group(1)), detail=err_msg)
+                status_code = _validated_status_code(match.group(1), default=502)
+                raise HTTPException(status_code=status_code, detail=_generic_http_detail(status_code))
         raise
 
 @app.post("/v1/messages/count_tokens")
@@ -911,7 +1023,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
             refreshed = await refresh_access_token_in_db(account["id"])
             access = refreshed.get("accessToken")
             if not access:
-                raise HTTPException(status_code=502, detail="Access token unavailable after refresh")
+                raise HTTPException(status_code=502, detail=_generic_http_detail(502))
         # Note: send_chat_request signature changed, but we use keyword args so it should be fine if we don't pass raw_payload
         # But wait, the return signature changed too! It now returns 4 values.
         # We need to unpack 4 values.
@@ -1009,6 +1121,14 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
             except Exception:
                 pass
             await _update_stats(account["id"], False)
+
+            # Extract upstream status code from "Upstream error {code}: {message}"
+            err_msg = str(e)
+            if err_msg.startswith("Upstream error "):
+                match = re.match(r"Upstream error (\d+):", err_msg)
+                if match:
+                    status_code = _validated_status_code(match.group(1), default=502)
+                    raise HTTPException(status_code=status_code, detail=_generic_http_detail(status_code))
             raise
 
 # ------------------------------------------------------------------------------
@@ -1111,7 +1231,7 @@ if CONSOLE_ENABLED:
             cid, csec = await register_client_min()
             dev = await device_authorize(cid, csec)
         except httpx.HTTPError as e:
-            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
         auth_id = str(uuid.uuid4())
         sess = {
@@ -1142,7 +1262,7 @@ if CONSOLE_ENABLED:
     async def auth_status(auth_id: str, _: bool = Depends(verify_console_token)):
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
-            raise HTTPException(status_code=404, detail="Auth session not found")
+            raise HTTPException(status_code=404, detail=_generic_http_detail(404))
         now_ts = int(time.time())
         deadline = sess["startTime"] + min(int(sess.get("expiresIn", 600)), 300)
         remaining = max(0, deadline - now_ts)
@@ -1161,7 +1281,7 @@ if CONSOLE_ENABLED:
         """
         sess = AUTH_SESSIONS.get(auth_id)
         if not sess:
-            raise HTTPException(status_code=404, detail="Auth session not found")
+            raise HTTPException(status_code=404, detail=_generic_http_detail(404))
         if sess.get("status") in ("completed", "timeout", "error"):
             return {
                 "status": sess["status"],
@@ -1180,7 +1300,7 @@ if CONSOLE_ENABLED:
             access_token = toks.get("accessToken")
             refresh_token = toks.get("refreshToken")
             if not access_token:
-                raise HTTPException(status_code=502, detail="No accessToken returned from OIDC")
+                raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
             acc = await _create_account_from_tokens(
                 sess["clientId"],
@@ -1198,11 +1318,11 @@ if CONSOLE_ENABLED:
             }
         except TimeoutError:
             sess["status"] = "timeout"
-            raise HTTPException(status_code=408, detail="Authorization timeout (5 minutes)")
+            raise HTTPException(status_code=408, detail=_generic_http_detail(408))
         except httpx.HTTPError as e:
             sess["status"] = "error"
             sess["error"] = str(e)
-            raise HTTPException(status_code=502, detail=f"OIDC error: {str(e)}")
+            raise HTTPException(status_code=502, detail=_generic_http_detail(502))
 
     # ------------------------------------------------------------------------------
     # Accounts Management API
@@ -1327,7 +1447,7 @@ if CONSOLE_ENABLED:
     async def delete_account(account_id: str, _: bool = Depends(verify_console_token)):
         rowcount = await _db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
         if rowcount == 0:
-            raise HTTPException(status_code=404, detail="Account not found")
+            raise HTTPException(status_code=404, detail=_generic_http_detail(404))
         return {"deleted": account_id}
 
     @app.patch("/v2/accounts/{account_id}")
@@ -1359,7 +1479,7 @@ if CONSOLE_ENABLED:
 
         rowcount = await _db.execute(f"UPDATE accounts SET {', '.join(fields)} WHERE id=?", tuple(values))
         if rowcount == 0:
-            raise HTTPException(status_code=404, detail="Account not found")
+            raise HTTPException(status_code=404, detail=_generic_http_detail(404))
         row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
         return _row_to_dict(row)
 
@@ -1373,7 +1493,7 @@ if CONSOLE_ENABLED:
         if account_id:
             row = await _db.fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
             if not row:
-                raise HTTPException(status_code=404, detail="Account not found")
+                raise HTTPException(status_code=404, detail=_generic_http_detail(404))
             account = _row_to_dict(row)
             # Check if token is expired or missing
             expires_at = account.get("expires_at")
@@ -1383,7 +1503,7 @@ if CONSOLE_ENABLED:
         else:
             candidates = await _list_enabled_accounts()
             if not candidates:
-                raise HTTPException(status_code=503, detail="No enabled account available")
+                raise HTTPException(status_code=503, detail=_generic_http_detail(503))
             account = random.choice(candidates)
             expires_at = account.get("expires_at")
             now_str = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -1404,7 +1524,7 @@ if CONSOLE_ENABLED:
     def index():
         path = BASE_DIR / "frontend" / "index.html"
         if not path.exists():
-            raise HTTPException(status_code=404, detail="frontend/index.html not found")
+            raise HTTPException(status_code=404, detail=_generic_http_detail(404))
         return FileResponse(str(path))
 
 # ------------------------------------------------------------------------------

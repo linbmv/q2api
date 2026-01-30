@@ -6,7 +6,7 @@ class ClaudeMessage(BaseModel):
     content: Union[str, List[Dict[str, Any]]]
 
 class ClaudeTool(BaseModel):
-    name: str
+    name: Optional[str] = None  # Optional for WebSearch tools
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
     type: Optional[str] = None  # For WebSearch: "web_search_20250305"

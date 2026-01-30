@@ -171,10 +171,9 @@ def convert_tool(tool: ClaudeTool) -> Dict[str, Any]:
     """Convert Claude tool to Amazon Q tool."""
     # Check if this is a WebSearch tool
     if tool.is_web_search():
-        # WebSearch tool format
+        # WebSearch tool format (no name field!)
         result = {
-            "type": tool.type,
-            "name": tool.name
+            "type": tool.type
         }
         if tool.max_uses is not None:
             result["max_uses"] = tool.max_uses
@@ -536,7 +535,8 @@ def _validate_tool_pairing(messages: List[ClaudeMessage], tools: Optional[List[A
     # Collect defined tool names
     if tools:
         for t in tools:
-            defined_tool_names.add(t.name)
+            if t.name:  # Skip WebSearch tools without name
+                defined_tool_names.add(t.name)
 
     # First pass: collect all tool_use IDs and names from assistant messages
     for msg in messages:
@@ -648,12 +648,18 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
     _, _, placeholder_tools = _validate_tool_pairing(req.messages, req.tools)
 
     aq_tools = []
+    web_search_tools = []
     long_desc_tools = []
     if req.tools:
         for t in req.tools:
-            if t.description and len(t.description) > 10240:
-                long_desc_tools.append({"name": t.name, "full_description": t.description})
-            aq_tools.append(convert_tool(t))
+            converted = convert_tool(t)
+            if t.is_web_search():
+                web_search_tools.append(converted)
+            else:
+                aq_tools.append(converted)
+                # Track long descriptions for regular tools only
+                if t.description and len(t.description) > 10240:
+                    long_desc_tools.append({"name": t.name, "full_description": t.description})
 
     # Add placeholder tools for undefined tools used in history
     aq_tools.extend(placeholder_tools)
@@ -851,6 +857,11 @@ def convert_claude_to_amazonq_request(req: ClaudeRequest, conversation_id: Optio
             "chatTriggerType": "MANUAL"
         }
     }
+
+    # Add WebSearch tools to conversationState if present
+    if web_search_tools:
+        result["conversationState"]["webSearchTools"] = web_search_tools
+        logger.info(f"Added {len(web_search_tools)} WebSearch tools to conversationState")
 
     # Debug log for tools
     if aq_tools:

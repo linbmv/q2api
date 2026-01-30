@@ -41,6 +41,28 @@ AUTH_SESSIONS = {}
 
 app = FastAPI(title="Amazon Q 账号投喂服务")
 
+_GENERIC_HTTP_DETAILS: Dict[int, str] = {
+    400: "Bad request",
+    401: "Unauthorized",
+    404: "Not found",
+    408: "Request timeout",
+    422: "Invalid request",
+    429: "Too many requests",
+    500: "Internal server error",
+    502: "Upstream error",
+    503: "Service unavailable",
+}
+
+def _generic_http_detail(status_code: int) -> str:
+    return _GENERIC_HTTP_DETAILS.get(status_code, "Request failed")
+
+def _validated_status_code(code, *, default: int = 502) -> int:
+    try:
+        code_int = int(code)
+    except Exception:
+        return default
+    return code_int if 100 <= code_int <= 599 else default
+
 
 # ============ 数据模型 ============
 class AuthStartRequest(BaseModel):
@@ -208,12 +230,12 @@ async def auth_start(body: Optional[AuthStartRequest] = None):
 async def auth_claim(auth_id: str):
     """轮询并创建账号（调用原服务）"""
     if auth_id not in AUTH_SESSIONS:
-        raise HTTPException(status_code=404, detail="授权会话不存在")
+        raise HTTPException(status_code=404, detail=_generic_http_detail(404))
 
     session = AUTH_SESSIONS[auth_id]
 
     if session["status"] == "completed":
-        raise HTTPException(status_code=400, detail="授权已完成")
+        raise HTTPException(status_code=400, detail=_generic_http_detail(400))
 
     try:
         # 轮询获取 tokens
@@ -255,14 +277,15 @@ async def auth_claim(auth_id: str):
         return {"status": "completed", "account": account}
 
     except TimeoutError as e:
-        raise HTTPException(status_code=408, detail=str(e))
+        raise HTTPException(status_code=408, detail=_generic_http_detail(408))
     except httpx.HTTPStatusError as e:
+        status_code = _validated_status_code(getattr(e.response, "status_code", None), default=502)
         raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"创建账号失败: {e.response.text}",
+            status_code=status_code,
+            detail=_generic_http_detail(status_code),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=_generic_http_detail(500))
 
 
 @app.post("/accounts/create")
@@ -294,12 +317,13 @@ async def create_account(account: AccountCreate):
             return r.json()
 
     except httpx.HTTPStatusError as e:
+        status_code = _validated_status_code(getattr(e.response, "status_code", None), default=502)
         raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"创建账号失败: {e.response.text}",
+            status_code=status_code,
+            detail=_generic_http_detail(status_code),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=_generic_http_detail(500))
 
 
 @app.post("/accounts/batch")
@@ -319,12 +343,13 @@ async def batch_create_accounts(request: BatchCreateRequest):
             r.raise_for_status()
             return r.json()
     except httpx.HTTPStatusError as e:
+        status_code = _validated_status_code(getattr(e.response, "status_code", None), default=502)
         raise HTTPException(
-            status_code=e.response.status_code,
-            detail=f"批量创建失败: {e.response.text}",
+            status_code=status_code,
+            detail=_generic_http_detail(status_code),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"未知错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=_generic_http_detail(500))
 
 
 @app.get("/health")
