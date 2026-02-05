@@ -22,6 +22,7 @@ import httpx
 
 from db import init_db, close_db, row_to_dict
 from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
+from account_pool import get_pool, AccountPool
 
 # ------------------------------------------------------------------------------
 # Error helpers (client-facing messages)
@@ -48,6 +49,23 @@ def _validated_status_code(code: Any, *, default: int = 502) -> int:
     except Exception:
         return default
     return code_int if 100 <= code_int <= 599 else default
+
+def _is_quota_error(exc: BaseException) -> bool:
+    """Check if an exception indicates a quota/rate limit error."""
+    # Check HTTPException status code
+    if isinstance(exc, HTTPException) and exc.status_code == 429:
+        return True
+    # Check httpx HTTPStatusError
+    if hasattr(exc, 'response') and hasattr(exc.response, 'status_code'):
+        if exc.response.status_code == 429:
+            return True
+    # Check exception attributes
+    status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
+    if status == 429:
+        return True
+    # Fallback to string matching
+    err_msg = str(exc).lower()
+    return '429' in err_msg or 'rate limit' in err_msg or 'quota' in err_msg
 
 # ------------------------------------------------------------------------------
 # Tokenizer (optional - fallback to estimation if tiktoken unavailable)
@@ -96,7 +114,6 @@ app.add_middleware(
 async def validation_exception_handler(request, exc):
     import logging
     logging.error(f"Validation error on {request.method} {request.url.path}")
-    logging.error(f"Request body: {await request.body()}")
     logging.error(f"Validation errors: {exc.errors()}")
     return JSONResponse(
         status_code=422,
@@ -356,19 +373,20 @@ async def verify_account(account: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
 async def resolve_account_for_key(bearer_key: Optional[str]) -> Dict[str, Any]:
     """
     Authorize request by OPENAI_KEYS (if configured), then select an AWS account.
-    Selection strategy: random among all enabled accounts. Authorization key does NOT map to any account.
+    Selection strategy: round-robin among all enabled accounts with error cooldown.
     """
     # Authorization
     if ALLOWED_API_KEYS:
         if not bearer_key or bearer_key not in ALLOWED_API_KEYS:
             raise HTTPException(status_code=401, detail=_generic_http_detail(401))
 
-    # Selection: random among enabled accounts
-    candidates = await _list_enabled_accounts()
+    # Selection: use account pool with round-robin and cooldown
+    pool = get_pool()
+    account = await pool.get_next()
 
-    if not candidates:
-        raise HTTPException(status_code=401, detail=_generic_http_detail(401))
-    return random.choice(candidates)
+    if not account:
+        raise HTTPException(status_code=503, detail=_generic_http_detail(503))
+    return account
 
 # ------------------------------------------------------------------------------
 # Pydantic Schemas
@@ -506,20 +524,48 @@ async def get_account(account_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=_generic_http_detail(404))
     return _row_to_dict(row)
 
-async def _update_stats(account_id: str, success: bool) -> None:
+async def _update_stats(
+    account_id: str,
+    success: bool,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    is_quota_error: bool = False
+) -> None:
+    """Update account statistics in both pool and database."""
+    pool = get_pool()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
     if success:
-        await _db.execute("UPDATE accounts SET success_count=success_count+1, error_count=0, updated_at=? WHERE id=?",
-                    (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
+        # Update pool stats
+        await pool.record_success(account_id, input_tokens, output_tokens)
+        # Update database - use COALESCE to handle NULL values from migration
+        await _db.execute(
+            """UPDATE accounts SET
+                success_count=COALESCE(success_count,0)+1,
+                request_count=COALESCE(request_count,0)+1,
+                error_count=0,
+                total_tokens=COALESCE(total_tokens,0)+?,
+                total_input_tokens=COALESCE(total_input_tokens,0)+?,
+                total_output_tokens=COALESCE(total_output_tokens,0)+?,
+                last_used_at=?,
+                updated_at=?
+            WHERE id=?""",
+            (input_tokens + output_tokens, input_tokens, output_tokens, now, now, account_id)
+        )
     else:
-        row = await _db.fetchone("SELECT error_count FROM accounts WHERE id=?", (account_id,))
-        if row:
-            new_count = (row['error_count'] or 0) + 1
-            if new_count >= MAX_ERROR_COUNT:
-                await _db.execute("UPDATE accounts SET error_count=?, enabled=0, updated_at=? WHERE id=?",
-                           (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
-            else:
-                await _db.execute("UPDATE accounts SET error_count=?, updated_at=? WHERE id=?",
-                           (new_count, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), account_id))
+        # Update pool stats with cooldown
+        await pool.record_error(account_id, is_quota_error=is_quota_error)
+        # Update database atomically - use CASE to disable when threshold reached
+        await _db.execute(
+            """UPDATE accounts SET
+                error_count=COALESCE(error_count,0)+1,
+                request_count=COALESCE(request_count,0)+1,
+                enabled=CASE WHEN COALESCE(error_count,0)+1>=? THEN 0 ELSE enabled END,
+                last_used_at=?,
+                updated_at=?
+            WHERE id=?""",
+            (MAX_ERROR_COUNT, now, now, account_id)
+        )
 
 # ------------------------------------------------------------------------------
 # Dependencies
@@ -535,7 +581,8 @@ async def require_account(
 async def verify_console_token(authorization: Optional[str] = Header(None)) -> bool:
     """验证控制台访问令牌"""
     if not CONSOLE_TOKEN:
-        return True
+        # Fail-closed: require token when console is enabled
+        raise HTTPException(status_code=401, detail=_generic_http_detail(401))
 
     bearer = _extract_bearer(authorization)
     if not bearer or bearer != CONSOLE_TOKEN:
@@ -776,19 +823,40 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                     event_type, payload = first_event
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
-                
+
                 # Process remaining events
                 async for event_type, payload in event_iter:
                     async for sse in handler.handle_event(event_type, payload):
                         yield sse
                 async for sse in handler.finish():
                     yield sse
-                await _update_stats(account["id"], True)
+                await _update_stats(
+                    account["id"], True,
+                    input_tokens=handler.input_tokens,
+                    output_tokens=handler.output_tokens
+                )
             except GeneratorExit:
-                # Client disconnected - update stats but don't re-raise
-                await _update_stats(account["id"], tracker.has_content if tracker else False)
-            except Exception:
-                await _update_stats(account["id"], False)
+                # Client disconnected - not an account error, just record partial stats
+                has_content = tracker.has_content if tracker else False
+                if has_content:
+                    await _update_stats(
+                        account["id"], True,
+                        input_tokens=handler.input_tokens,
+                        output_tokens=handler.output_tokens
+                    )
+                # Don't record as error - client disconnect is not account's fault
+            except asyncio.CancelledError:
+                # Task cancelled - same handling as client disconnect
+                has_content = tracker.has_content if tracker else False
+                if has_content:
+                    await _update_stats(
+                        account["id"], True,
+                        input_tokens=handler.input_tokens,
+                        output_tokens=handler.output_tokens
+                    )
+            except Exception as e:
+                # Check for quota error (429)
+                await _update_stats(account["id"], False, is_quota_error=_is_quota_error(e))
                 raise
 
         if req.stream:
@@ -896,7 +964,8 @@ async def claude_messages(req: ClaudeRequest, account: Dict[str, Any] = Depends(
                 await event_iter.aclose()
         except Exception:
             pass
-        await _update_stats(account["id"], False)
+        # Check for quota error
+        await _update_stats(account["id"], False, is_quota_error=_is_quota_error(e))
 
         # Extract upstream status code from "Upstream error {code}: {message}"
         err_msg = str(e)
@@ -1037,10 +1106,13 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
             prompt_tokens = count_tokens(prompt_text)
 
             text, _, tracker = await _send_upstream(stream=False)
-            await _update_stats(account["id"], bool(text))
-            
             completion_tokens = count_tokens(text or "")
-            
+            await _update_stats(
+                account["id"], bool(text),
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens
+            )
+
             return JSONResponse(content=_openai_non_streaming_response(
                 text or "",
                 model,
@@ -1048,7 +1120,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                 completion_tokens=completion_tokens
             ))
         except Exception as e:
-            await _update_stats(account["id"], False)
+            await _update_stats(account["id"], False, is_quota_error=_is_quota_error(e))
             raise
     else:
         created = int(time.time())
@@ -1102,16 +1174,36 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                             "total_tokens": prompt_tokens + completion_tokens,
                         }
                     })
-                    
+
                     yield "data: [DONE]\n\n"
-                    await _update_stats(account["id"], True)
+                    await _update_stats(
+                        account["id"], True,
+                        input_tokens=prompt_tokens,
+                        output_tokens=completion_tokens
+                    )
                 except GeneratorExit:
-                    # Client disconnected - update stats but don't re-raise
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
-                except Exception:
-                    await _update_stats(account["id"], tracker.has_content if tracker else False)
+                    # Client disconnected - not an account error, just record partial stats
+                    has_content = tracker.has_content if tracker else False
+                    if has_content:
+                        await _update_stats(
+                            account["id"], True,
+                            input_tokens=prompt_tokens,
+                            output_tokens=count_tokens(completion_text)
+                        )
+                    # Don't record as error - client disconnect is not account's fault
+                except asyncio.CancelledError:
+                    # Task cancelled - same handling as client disconnect
+                    has_content = tracker.has_content if tracker else False
+                    if has_content:
+                        await _update_stats(
+                            account["id"], True,
+                            input_tokens=prompt_tokens,
+                            output_tokens=count_tokens(completion_text)
+                        )
+                except Exception as e:
+                    await _update_stats(account["id"], False, is_quota_error=_is_quota_error(e))
                     raise
-            
+
             return StreamingResponse(event_gen(), media_type="text/event-stream")
         except Exception as e:
             # Ensure iterator (if created) is closed to release upstream connection
@@ -1120,7 +1212,7 @@ async def chat_completions(req: ChatCompletionRequest, account: Dict[str, Any] =
                     await it.aclose()
             except Exception:
                 pass
-            await _update_stats(account["id"], False)
+            await _update_stats(account["id"], False, is_quota_error=_is_quota_error(e))
 
             # Extract upstream status code from "Upstream error {code}: {message}"
             err_msg = str(e)
@@ -1206,16 +1298,21 @@ if CONSOLE_ENABLED:
     @app.post("/api/login", response_model=AdminLoginResponse)
     async def admin_login(request: AdminLoginRequest) -> AdminLoginResponse:
         """Admin login endpoint - password only"""
-        if not CONSOLE_TOKEN or request.password == CONSOLE_TOKEN:
+        # Fail-closed: require CONSOLE_TOKEN to be set
+        if not CONSOLE_TOKEN:
+            return AdminLoginResponse(
+                success=False,
+                message="Console not configured"
+            )
+        if request.password == CONSOLE_TOKEN:
             return AdminLoginResponse(
                 success=True,
                 message="Login successful"
             )
-        else:
-            return AdminLoginResponse(
-                success=False,
-                message="Invalid password"
-            )
+        return AdminLoginResponse(
+            success=False,
+            message="Invalid password"
+        )
 
     # ------------------------------------------------------------------------------
     # Device Authorization Endpoints
@@ -1487,6 +1584,178 @@ if CONSOLE_ENABLED:
     async def manual_refresh(account_id: str, _: bool = Depends(verify_console_token)):
         return await refresh_access_token_in_db(account_id)
 
+    # ------------------------------------------------------------------------------
+    # Account Export/Import (P3)
+    # ------------------------------------------------------------------------------
+
+    @app.get("/v2/accounts/export")
+    async def export_accounts(
+        include_secrets: bool = False,
+        enabled_only: bool = False,
+        _: bool = Depends(verify_console_token)
+    ):
+        """
+        Export accounts as JSON for backup.
+
+        Args:
+            include_secrets: If True, include clientSecret and tokens (default: False for security)
+            enabled_only: If True, only export enabled accounts (default: False)
+        """
+        query = "SELECT * FROM accounts"
+        if enabled_only:
+            query += " WHERE enabled=1"
+        query += " ORDER BY created_at DESC"
+
+        rows = await _db.fetchall(query)
+        accounts = []
+
+        for row in rows:
+            acc = _row_to_dict(row)
+            export_acc = {
+                "id": acc.get("id"),
+                "label": acc.get("label"),
+                "clientId": acc.get("clientId"),
+                "enabled": acc.get("enabled"),
+                "created_at": acc.get("created_at"),
+                "success_count": acc.get("success_count", 0),
+                "error_count": acc.get("error_count", 0),
+                "request_count": acc.get("request_count", 0),
+                "total_tokens": acc.get("total_tokens", 0),
+                "total_input_tokens": acc.get("total_input_tokens", 0),
+                "total_output_tokens": acc.get("total_output_tokens", 0),
+                "last_used_at": acc.get("last_used_at"),
+            }
+
+            if include_secrets:
+                export_acc["clientSecret"] = acc.get("clientSecret")
+                export_acc["refreshToken"] = acc.get("refreshToken")
+                export_acc["accessToken"] = acc.get("accessToken")
+                export_acc["other"] = acc.get("other")
+
+            accounts.append(export_acc)
+
+        return {
+            "version": "1.0",
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "include_secrets": include_secrets,
+            "count": len(accounts),
+            "accounts": accounts
+        }
+
+    class ImportAccountsRequest(BaseModel):
+        accounts: List[Dict[str, Any]]
+        skip_existing: bool = True
+
+    @app.post("/v2/accounts/import")
+    async def import_accounts(
+        request: ImportAccountsRequest,
+        _: bool = Depends(verify_console_token)
+    ):
+        """
+        Import accounts from exported JSON.
+
+        Args:
+            accounts: List of account objects to import
+            skip_existing: If True, skip accounts with existing clientId (default: True)
+        """
+        imported = 0
+        skipped = 0
+        errors = []
+
+        for acc_data in request.accounts:
+            try:
+                client_id = acc_data.get("clientId")
+                if not client_id:
+                    errors.append({"error": "Missing clientId", "data": acc_data})
+                    continue
+
+                # Check if account with this clientId already exists
+                existing = await _db.fetchone(
+                    "SELECT id FROM accounts WHERE clientId=?",
+                    (client_id,)
+                )
+                if existing and request.skip_existing:
+                    skipped += 1
+                    continue
+
+                now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                acc_id = acc_data.get("id") or str(uuid.uuid4())
+
+                # If account exists and not skipping, update it
+                if existing:
+                    await _db.execute(
+                        """UPDATE accounts SET
+                            label=?, clientSecret=?, refreshToken=?, accessToken=?,
+                            other=?, enabled=?, updated_at=?
+                        WHERE clientId=?""",
+                        (
+                            acc_data.get("label"),
+                            acc_data.get("clientSecret"),
+                            acc_data.get("refreshToken"),
+                            acc_data.get("accessToken"),
+                            json.dumps(acc_data.get("other")) if acc_data.get("other") else None,
+                            1 if acc_data.get("enabled", True) else 0,
+                            now,
+                            client_id
+                        )
+                    )
+                else:
+                    other_str = json.dumps(acc_data.get("other")) if acc_data.get("other") else None
+                    await _db.execute(
+                        """INSERT INTO accounts
+                            (id, label, clientId, clientSecret, refreshToken, accessToken,
+                             other, last_refresh_time, last_refresh_status, created_at, updated_at, enabled)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            acc_id,
+                            acc_data.get("label"),
+                            client_id,
+                            acc_data.get("clientSecret"),
+                            acc_data.get("refreshToken"),
+                            acc_data.get("accessToken"),
+                            other_str,
+                            None,
+                            "never",
+                            acc_data.get("created_at") or now,
+                            now,
+                            1 if acc_data.get("enabled", True) else 0
+                        )
+                    )
+                imported += 1
+
+            except Exception as e:
+                errors.append({"error": str(e), "clientId": acc_data.get("clientId")})
+
+        # Reload pool after import
+        pool = get_pool()
+        accounts = await _list_enabled_accounts()
+        await pool.reload(accounts)
+
+        return {
+            "imported": imported,
+            "skipped": skipped,
+            "errors": errors,
+            "total_in_request": len(request.accounts)
+        }
+
+    # ------------------------------------------------------------------------------
+    # Pool Status API
+    # ------------------------------------------------------------------------------
+
+    @app.get("/v2/pool/status")
+    async def get_pool_status(_: bool = Depends(verify_console_token)):
+        """Get account pool status including cooldown information."""
+        pool = get_pool()
+        return await pool.get_pool_status()
+
+    @app.post("/v2/pool/reload")
+    async def reload_pool(_: bool = Depends(verify_console_token)):
+        """Force reload account pool from database."""
+        pool = get_pool()
+        accounts = await _list_enabled_accounts()
+        await pool.reload(accounts)
+        return {"status": "reloaded", "count": len(accounts)}
+
     @app.post("/v2/chat/test")
     async def admin_chat_test(req: ChatCompletionRequest, account_id: Optional[str] = None, _: bool = Depends(verify_console_token)):
         """Admin chat test - uses admin auth, selects account by id or random."""
@@ -1579,10 +1848,53 @@ async def health():
 @app.on_event("startup")
 async def startup_event():
     """Initialize database and start background tasks on startup."""
+    import logging
+    # Security warning: open proxy if OPENAI_KEYS not set
+    if not ALLOWED_API_KEYS:
+        logging.warning("SECURITY WARNING: OPENAI_KEYS is not set - API is accessible without authentication!")
+    if not CONSOLE_TOKEN:
+        logging.warning("SECURITY WARNING: CONSOLE_TOKEN is not set - console endpoints will reject all requests")
+
     await _init_global_client()
     await _ensure_db()
+    # Initialize account pool
+    pool = get_pool()
+    accounts = await _list_enabled_accounts()
+    await pool.reload(accounts)
     asyncio.create_task(_refresh_stale_tokens())
+    asyncio.create_task(_reload_pool_periodically())
+    asyncio.create_task(_cleanup_auth_sessions_periodically())
     # asyncio.create_task(_verify_disabled_accounts_loop())
+
+
+async def _reload_pool_periodically():
+    """Periodically reload account pool from database."""
+    while True:
+        try:
+            await asyncio.sleep(60)  # Reload every minute
+            pool = get_pool()
+            accounts = await _list_enabled_accounts()
+            await pool.reload(accounts)
+        except Exception:
+            traceback.print_exc()
+
+
+async def _cleanup_auth_sessions_periodically():
+    """Periodically cleanup expired auth sessions to prevent memory leaks."""
+    SESSION_TTL = 600  # 10 minutes max session lifetime
+    while True:
+        try:
+            await asyncio.sleep(300)  # Check every 5 minutes
+            now = int(time.time())
+            expired_ids = [
+                auth_id for auth_id, sess in AUTH_SESSIONS.items()
+                if now - sess.get("startTime", 0) > SESSION_TTL
+            ]
+            for auth_id in expired_ids:
+                del AUTH_SESSIONS[auth_id]
+        except Exception:
+            traceback.print_exc()
+
 
 @app.on_event("shutdown")
 async def shutdown_event():

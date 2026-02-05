@@ -37,6 +37,12 @@ ACCOUNTS_COLUMNS = [
     ("error_count", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
     ("success_count", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
     ("expires_at", "TEXT", "TEXT", "TEXT", None),
+    # P2: Enhanced statistics fields
+    ("request_count", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
+    ("total_tokens", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
+    ("total_input_tokens", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
+    ("total_output_tokens", "INTEGER DEFAULT 0", "INTEGER DEFAULT 0", "INT DEFAULT 0", "0"),
+    ("last_used_at", "TEXT", "TEXT", "TEXT", None),
 ]
 
 # Optional imports for other backends

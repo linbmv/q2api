@@ -194,6 +194,13 @@ class ClaudeStreamHandler:
         self.pending_start_tag_chars: int = 0
         self.quote_state: QuoteState = QuoteState()  # Persistent quote state
 
+    @property
+    def output_tokens(self) -> int:
+        """Calculate output tokens from response buffer and tool inputs."""
+        full_text = "".join(self.response_buffer)
+        full_tool_input = "".join(self.all_tool_inputs)
+        return count_tokens(full_text) + count_tokens(full_tool_input)
+
     async def handle_event(self, event_type: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Process a single Amazon Q event and yield Claude SSE events."""
 
