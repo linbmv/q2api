@@ -17,7 +17,7 @@ ALLOWED_CANONICAL_MODELS: Set[str] = {
     "claude-sonnet-4",
     "claude-sonnet-3.5",
     "claude-haiku-4.5",
-    "claude-opus-4.5",
+    "claude-opus-4.6",
 }
 
 # 默认规范模型（验证有效性）
@@ -31,9 +31,11 @@ if DEFAULT_CANONICAL_MODEL not in ALLOWED_CANONICAL_MODELS:
 
 # 模型名称映射表
 MODEL_MAPPING: Dict[str, str] = {
+    # Claude 4.6
+    "claude-opus-4-6": "claude-opus-4.6",
     # Claude 4.5
     "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
-    "claude-haiku-4-5-20251001": "claude-sonnet-4.5",
+    "claude-haiku-4-5-20251001": "claude-haiku-4.5",
     # Claude 4
     "claude-sonnet-4-20250514": "claude-sonnet-4",
     # Claude 3.5

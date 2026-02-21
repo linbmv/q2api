@@ -8,6 +8,7 @@ import importlib.util
 import random
 import secrets
 import re
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List, Any, AsyncGenerator, Tuple
@@ -23,6 +24,9 @@ import httpx
 from db import init_db, close_db, row_to_dict
 from message_processor import process_history_for_amazonq, merge_duplicate_tool_results
 from account_pool import get_pool, AccountPool
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
 # Error helpers (client-facing messages)
@@ -219,24 +223,92 @@ async def _init_global_client():
     # max_keepalive_connections: 保持活跃的连接数
     # keepalive_expiry: 连接保持时间
     limits = httpx.Limits(
-        max_keepalive_connections=60,
-        max_connections=60,  # 提高到500以支持更高并发
-        keepalive_expiry=30.0  # 30秒后释放空闲连接
+        max_keepalive_connections=200,
+        max_connections=200,
+        keepalive_expiry=1.0
     )
-    # 为流式响应设置更长的超时
     timeout = httpx.Timeout(
-        connect=10.0,  # 连接超时(增加以支持代理和TLS握手)
-        read=300.0,    # 读取超时(流式响应需要更长时间)
-        write=10.0,    # 写入超时(支持大型请求通过慢速代理)
-        pool=10.0      # 从连接池获取连接的超时时间(高负载缓冲)
+        connect=2.0,
+        read=300.0,
+        write=2.0,
+        pool=1.0
     )
     GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
+
+def get_global_client() -> Optional[httpx.AsyncClient]:
+    return GLOBAL_CLIENT
 
 async def _close_global_client():
     global GLOBAL_CLIENT
     if GLOBAL_CLIENT:
         await GLOBAL_CLIENT.aclose()
         GLOBAL_CLIENT = None
+
+async def _recycle_global_client():
+    pending_close_clients = []
+    while True:
+        try:
+            await asyncio.sleep(60)
+            logger.info("[连接回收] 开始回收全局HTTP客户端...")
+            global GLOBAL_CLIENT
+            old_client = GLOBAL_CLIENT
+            proxies = _get_proxies()
+            mounts = None
+            if proxies:
+                proxy_url = proxies.get("https") or proxies.get("http")
+                if proxy_url:
+                    mounts = {
+                        "https://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                        "http://": httpx.AsyncHTTPTransport(proxy=proxy_url),
+                    }
+            limits = httpx.Limits(max_keepalive_connections=200, max_connections=200, keepalive_expiry=1.0)
+            timeout = httpx.Timeout(connect=2.0, read=300.0, write=2.0, pool=1.0)
+            GLOBAL_CLIENT = httpx.AsyncClient(mounts=mounts, timeout=timeout, limits=limits)
+            logger.info("[连接回收] 新客户端已创建，等待120秒后关闭旧客户端...")
+            if old_client:
+                pending_close_clients.append(old_client)
+                async def _force_close_old_client(client_to_close):
+                    try:
+                        await asyncio.sleep(120)
+                        logger.info("[连接回收] 开始强制关闭旧客户端...")
+                        try:
+                            await asyncio.wait_for(client_to_close.aclose(), timeout=2.0)
+                            logger.info("[连接回收] 旧客户端已成功关闭")
+                        except asyncio.TimeoutError:
+                            logger.warning("[连接回收] 旧客户端关闭超时，尝试强制终止...")
+                            try:
+                                if hasattr(client_to_close, '_transport') and client_to_close._transport:
+                                    transport = client_to_close._transport
+                                    if hasattr(transport, '_pool'):
+                                        pool = transport._pool
+                                        try:
+                                            await asyncio.wait_for(pool.aclose(), timeout=0.5)
+                                        except:
+                                            pass
+                                logger.info("[连接回收] 已尝试强制终止底层连接")
+                            except Exception as e:
+                                logger.warning(f"[连接回收] 强制终止底层连接失败: {e}")
+                        except Exception as e:
+                            logger.warning(f"[连接回收] 关闭旧客户端时出错: {e}")
+                        finally:
+                            try:
+                                pending_close_clients.remove(client_to_close)
+                            except ValueError:
+                                pass
+                            logger.info(f"[连接回收] 当前待关闭客户端数量: {len(pending_close_clients)}")
+                    except Exception as e:
+                        logger.error(f"[连接回收] 延迟关闭任务失败: {e}")
+                asyncio.create_task(_force_close_old_client(old_client))
+                logger.info("[连接回收] 已启动旧客户端延迟关闭任务")
+            if len(pending_close_clients) > 5:
+                logger.warning(f"[连接回收] 待关闭客户端过多({len(pending_close_clients)})，可能存在关闭失败")
+        except Exception as e:
+            logger.error(f"[连接回收] 回收失败: {e}")
+            try:
+                if GLOBAL_CLIENT is None:
+                    await _init_global_client()
+            except Exception:
+                pass
 
 # ------------------------------------------------------------------------------
 # Database helpers
