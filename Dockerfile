@@ -53,7 +53,6 @@ RUN pip install --no-cache-dir /tmp/*.whl && rm -f /tmp/*.whl
 
 # Copy application code
 COPY *.py /app/
-COPY app/ /app/app/
 COPY frontend/ /app/frontend/
 COPY templates/ /app/templates/
 
@@ -64,4 +63,4 @@ EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 
 # Run application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
