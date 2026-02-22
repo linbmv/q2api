@@ -21,8 +21,8 @@ def _oidc_headers() -> Dict[str, str]:
     }
 
 async def _get_db():
-    from db import get_db
-    return get_db()
+    from db import get_database_backend
+    return get_database_backend()
 
 async def list_enabled_accounts() -> List[Dict[str, Any]]:
     db = await _get_db()
